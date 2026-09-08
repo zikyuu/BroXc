@@ -1,3 +1,6 @@
 opencv-python
 easyocr
 page-dewarp
+transformers
+torch
+sentencepiece
