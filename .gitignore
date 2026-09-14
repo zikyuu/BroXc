@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# personal data — never belongs in version control
+expenses.db
+*.json
+receipt.jpg
+receipt_thresh.png
+youtrip_screenshot.png
