@@ -69,12 +69,16 @@ def _run_easyocr(reader: easyocr.Reader, image: np.ndarray) -> Tuple[List[OcrLin
     #avg confidence -> help decide if dewarp fallback needs to be used
 
 
-def run_ocr(image_path: str, languages: List[str]) -> OcrResult:
-    """Full OCR pass: preprocess -> EasyOCR -> confidence gate -> optional page-dewarp retry."""
+def run_ocr(image_path: str, languages: List[str], allow_dewarp: bool = False) -> OcrResult:
+    """Full OCR pass: preprocess -> EasyOCR -> confidence gate -> optional page-dewarp retry.
+
+    Dewarp is off by default: the live inputs are clean screenshots, where it does more harm
+    than good. Pass allow_dewarp=True to re-enable it for photographed receipts.
+    """
     reader = _get_reader(tuple(languages))
 
     lines, raw_text, confidence = _run_easyocr(reader, _preprocess(image_path))
-    if confidence >= LOW_CONFIDENCE_THRESHOLD:
+    if not allow_dewarp or confidence >= LOW_CONFIDENCE_THRESHOLD:
         return OcrResult(lines, raw_text, confidence, used_dewarp=False)
 
     try:
