@@ -53,6 +53,7 @@ class ReceiptDraft:
     '''suggested_category is only ever "Mystery" or None — whole receipt unreadable, not a real category'''
 
     merchant: Optional[str] = None
+    merchant_original: Optional[str] = None  # store name as printed on the original-language receipt, for matching against YouTrip's description
     date: Optional[str] = None
     currency: Optional[str] = None
     total: Optional[float] = None

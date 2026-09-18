@@ -23,6 +23,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     merchant TEXT,
+    merchant_original TEXT,
     date TEXT,
     currency TEXT,
     total REAL,
@@ -86,13 +87,13 @@ def save_receipt(conn: sqlite3.Connection, draft: ReceiptDraft) -> int:
     """Persists a ReceiptDraft and its line items (with tags), returns the new receipt id."""
     cursor = conn.execute(
         """
-        INSERT INTO receipts (merchant, date, currency, total, tax, status,
+        INSERT INTO receipts (merchant, merchant_original, date, currency, total, tax, status,
                                suggested_category, ocr_confidence, raw_text, source_image_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            draft.merchant, draft.date, draft.currency, draft.total, draft.tax,
-            draft.status.value, draft.suggested_category, draft.ocr_confidence,
+            draft.merchant, draft.merchant_original, draft.date, draft.currency, draft.total,
+            draft.tax, draft.status.value, draft.suggested_category, draft.ocr_confidence,
             draft.raw_text, draft.source_image_path,
         ),
     )
@@ -154,7 +155,7 @@ def get_unmatched_receipts(conn: sqlite3.Connection) -> List[Tuple[int, ReceiptD
     loaded here — the matcher only needs merchant/date/total, not the full item list."""
     rows = conn.execute(
         """
-        SELECT id, merchant, date, currency, total, tax, status,
+        SELECT id, merchant, merchant_original, date, currency, total, tax, status,
                suggested_category, ocr_confidence, raw_text, source_image_path
         FROM receipts
         WHERE id NOT IN (
@@ -166,12 +167,13 @@ def get_unmatched_receipts(conn: sqlite3.Connection) -> List[Tuple[int, ReceiptD
 
     results = []
     for row in rows:
-        (receipt_id, merchant, date, currency, total, tax, status,
+        (receipt_id, merchant, merchant_original, date, currency, total, tax, status,
          suggested_category, ocr_confidence, raw_text, source_image_path) = row
         draft = ReceiptDraft(
-            merchant=merchant, date=date, currency=currency, total=total, tax=tax,
-            status=ReviewStatus(status), suggested_category=suggested_category,
-            ocr_confidence=ocr_confidence, raw_text=raw_text, source_image_path=source_image_path,
+            merchant=merchant, merchant_original=merchant_original, date=date,
+            currency=currency, total=total, tax=tax, status=ReviewStatus(status),
+            suggested_category=suggested_category, ocr_confidence=ocr_confidence,
+            raw_text=raw_text, source_image_path=source_image_path,
         )
         results.append((receipt_id, draft))
     return results

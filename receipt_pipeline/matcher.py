@@ -25,7 +25,7 @@ MAX_ACCEPTABLE_COST = 3.0
 # even if the cost is absurdly high. This threshold allows us to filter out those bad matches.
 # prevents forcefitting receipts to transactions, when in reality maybe the user is just lazy and hasnt uploaded the corresponding receipt lol
 
-DATE_WINDOW_DAYS = 1  # settlement lag receipts can plausibly appear within
+DATE_COST_SCALE_DAYS = 1  # instant-processing card: even a 1-day gap is unusual; kept at 1 (not 0) only for midnight/timezone quirks
 
 
 @dataclass
@@ -60,11 +60,16 @@ def _implied_rate(receipt: ReceiptDraft, transaction: YouTripTransaction) -> Opt
     return receipt.total / transaction.amount_sgd
 
 
-def _name_cost(merchant: Optional[str], description: Optional[str]) -> float:
-    if not merchant or not description:
+def _name_cost(receipt: ReceiptDraft, description: Optional[str]) -> float:
+    """Best of the translated and original-language merchant names — the translated one can
+    differ from the Swedish name YouTrip shows, so either matching well is enough."""
+    if not description:
         return 1.0
-    similarity = fuzz.partial_ratio(merchant.lower(), description.lower())  # 0-100
-    return 1.0 - (similarity / 100)
+    names = [n for n in (receipt.merchant, receipt.merchant_original) if n]
+    if not names:
+        return 1.0
+    best = max(fuzz.partial_ratio(n.lower(), description.lower()) for n in names)  # 0-100
+    return 1.0 - (best / 100)
 
 
 def match_receipts_to_transactions(
@@ -88,7 +93,7 @@ def match_receipts_to_transactions(
         row = []
         for transaction in transactions:
             date_cost = _date_cost(receipt.date, transaction.date)
-            name_cost = _name_cost(receipt.merchant, transaction.description)
+            name_cost = _name_cost(receipt, transaction.description)
 
             rate = _implied_rate(receipt, transaction)
             fx_cost = 1.0 if rate is None or median_rate is None else abs(rate - median_rate) / median_rate
