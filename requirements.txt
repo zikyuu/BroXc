@@ -4,3 +4,7 @@ page-dewarp
 transformers
 torch
 sentencepiece
+rapidfuzz
+python-dateutil
+scipy
+

@@ -5,10 +5,10 @@
 import sys
 from typing import List, Optional 
 
-from .merchant_profiles import MerchantProfileStore
-from .ocr_engine import run_ocr
-from .parser import parse_receipt
-from .tag_store import TagStore
+from .receipts.merchant_profiles import MerchantProfileStore
+from .shared.ocr.engine import run_ocr
+from .receipts.parser import parse_receipt
+from .receipts.tag_store import TagStore
 from .types import ReceiptDraft
 
 def run_pipeline(

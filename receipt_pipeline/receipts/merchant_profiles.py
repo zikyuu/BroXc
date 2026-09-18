@@ -2,7 +2,7 @@
 '''append only store of HINTS learned from user corrections, not a model being retarained'''
 
 import json
-from dataclasses import asfict, dataclass, field 
+from dataclasses import asdict, dataclass, field 
 from pathlib import Path 
 from typing import Dict, List, Optional, Tuple
 

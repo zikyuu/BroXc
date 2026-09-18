@@ -63,3 +63,13 @@ class ReceiptDraft:
     ocr_confidence: Optional[float] = None
     raw_text: Optional[str] = None
     source_image_path: Optional[str] = None
+
+
+@dataclass
+class YouTripTransaction:
+    '''one row parsed from a YouTrip transaction-list screenshot — the other half of matching, see Hungarian matcher milestone'''
+
+    date: Optional[str] = None
+    description: Optional[str] = None
+    amount_sgd: Optional[float] = None
+    matched_receipt_path: Optional[str] = None  # filled in once the matcher runs, still None until then
