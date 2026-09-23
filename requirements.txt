@@ -7,4 +7,7 @@ sentencepiece
 rapidfuzz
 python-dateutil
 scipy
+fastapi
+uvicorn
+python-multipart
 

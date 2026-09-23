@@ -73,4 +73,6 @@ class YouTripTransaction:
     date: Optional[str] = None
     description: Optional[str] = None
     amount_sgd: Optional[float] = None
+    local_amount: Optional[float] = None  # what the merchant actually charged (e.g. 10.00), shown beside the SGD figure on the row
+    local_currency: Optional[str] = None  # e.g. "SEK"
     matched_receipt_path: Optional[str] = None  # filled in once the matcher runs, still None until then

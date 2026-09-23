@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Expense Tracker</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Expense Tracker</h1>
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" data-tab="spending" aria-selected="true">Spending</button>
+      <button role="tab" data-tab="reconcile" aria-selected="false">Reconcile</button>
+      <button role="tab" data-tab="add" aria-selected="false">Add</button>
+    </nav>
+  </header>
+
+  <button id="status" class="status" type="button" hidden></button>
+
+  <main>
+    <section id="tab-spending" class="tab" role="tabpanel"></section>
+    <section id="tab-reconcile" class="tab" role="tabpanel" hidden></section>
+    <section id="tab-add" class="tab" role="tabpanel" hidden></section>
+  </main>
+
+  <div id="bulkbar" class="bulkbar" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

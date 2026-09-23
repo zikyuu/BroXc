@@ -3,6 +3,8 @@ __pycache__/
 
 # personal data — never belongs in version control
 expenses.db
+demo.db
+uploads/
 *.json
 receipt.jpg
 receipt_thresh.png
