@@ -15,19 +15,22 @@ from .merchant_profiles import MerchantProfileStore
 from .tag_store import TagStore
 
 # best guesses at how Google renders Swedish receipt terms — calibrate against a real screenshot
-TOTAL_KEYWORDS = ["total", "to pay", "amount due"]
+TOTAL_KEYWORDS = ["total", "to pay", "paying", "amount due"]  # Google rendered "ATT BETALA" as "PAYING"
 TAX_KEYWORDS = ["vat", "gst", "tax"]
 DEPOSIT_KEYWORDS = ["deposit", "pledge", "pant"]
-DISCOUNT_KEYWORDS = ["discount", "rebate"]
+DISCOUNT_KEYWORDS = ["discount", "discounts", "rebate", "rebates"]
 # recap lines that restate a figure already captured elsewhere, not real items or totals
 SKIP_KEYWORDS = ["subtotal", "sub total", "summary", "summation"]
 
 AMOUNT_PATTERN = re.compile(r"-?\d+[.,]\d{2}\b")
 QUANTITY_PATTERN = re.compile(r"\b(\d+)\s*[x×]\s*", re.IGNORECASE)
-# a quantity/weight breakdown on its own line under an item: "2 pcs x 20.95", "0,298 kg x 103,16 SEK/kg"
-QUANTITY_BREAKDOWN_PATTERN = re.compile(r"^\s*([\d.,]+)\s*[A-Za-z]{1,6}\.?\s*x\s*[\d.,]+", re.IGNORECASE)
+# a quantity/weight breakdown on its own line under an item: "pcs x 20.95", "0,298 kg x 103,16 SEK/kg".
+# Captures the UNIT PRICE only — the leading number is often dropped or mangled by translation/OCR
+# ("298kg *"), so quantity is inferred as item price / unit price instead of being read directly.
+QUANTITY_BREAKDOWN_PATTERN = re.compile(r"^\s*(?:[\d.,]+\s*)?[A-Za-z]{1,6}\.?\s*[x×*]\s*(\d+[.,]\d{2})", re.IGNORECASE)
 CURRENCY_PATTERN = re.compile(r"(?<!\w)(SEK|EUR|NOK|DKK|GBP|USD|SGD|KR|€|£|\$)(?!\w)", re.IGNORECASE)
-DATE_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
+# the ISO form isn't word-anchored so a stray OCR character glued on the front ("62026-08-21") still matches
+DATE_PATTERN = re.compile(r"20\d{2}-\d{2}-\d{2}|\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
 
 MYSTERY_LINE_CONFIDENCE = 0.4  # below this per-row confidence, tag the item "mystery"
 
@@ -60,7 +63,7 @@ def _matches_any(text: str, keywords: List[str]) -> bool:
 def _guess_merchant(rows: List[str]) -> Optional[str]:
     for row in rows:
         stripped = row.strip()
-        if len(stripped) >= 3 and not AMOUNT_PATTERN.search(stripped):
+        if sum(c.isalpha() for c in stripped) >= 3 and not AMOUNT_PATTERN.search(stripped):
             return stripped
     return None
 
@@ -106,6 +109,7 @@ def parse_translated_receipt(
     tax: Optional[float] = None
     line_items: List[Lineitem] = []
     seen_total = False
+    in_discount_section = False
 
     for text, row_confidence in grouped_rows:
         text = text.strip()
@@ -136,12 +140,19 @@ def parse_translated_receipt(
 
         breakdown = QUANTITY_BREAKDOWN_PATTERN.match(text)
         if breakdown and line_items:
-            line_items[-1].quantity = float(breakdown.group(1).replace(",", "."))
+            unit_price = float(breakdown.group(1).replace(",", "."))
+            if unit_price > 0:
+                line_items[-1].quantity = round(line_items[-1].price / unit_price, 3)
             continue
 
         amount = _extract_amount(text)
         if amount is None:
+            if _matches_any(text, DISCOUNT_KEYWORDS):
+                in_discount_section = True  # a "DISCOUNTS" header: amounts below are discounts even if OCR dropped the minus sign
             continue
+
+        if in_discount_section:
+            amount = -abs(amount)
 
         without_amount = _strip_amount(text)
 

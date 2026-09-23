@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import easyocr
@@ -94,8 +94,15 @@ def run_ocr(image_path: str, languages: List[str], allow_dewarp: bool = False) -
 
     return OcrResult(lines, raw_text, confidence, used_dewarp=False)
 
-def group_into_rows(lines: List[OcrLine], y_tolerance: float = 15) -> List[Tuple[str, float]]:
-    """Clusters text boxes into visual lines by vertical position, each read left-to-right."""
+ROW_TOLERANCE_FACTOR = 0.3  # fraction of the median text-box height two boxes may differ by and still share a row
+
+def group_into_rows(lines: List[OcrLine], y_tolerance: Optional[float] = None) -> List[Tuple[str, float]]:
+    """Clusters text boxes into visual lines by vertical position, each read left-to-right.
+
+    y_tolerance is in pixels; left as None it scales with the median text height, so the same
+    setting works whether the screenshot is 430px or 1200px wide (a fixed pixel value fused
+    neighbouring rows on small images and split name from price on large ones).
+    """
     '''returns (row text, row confidence) pairs wherer row confidence is the minimum of that rows boxes' confidence'''
     ''' aka if the item name is perfectly clear but price is smudged, it is overall counted as low confidence'''
     def y_center(line: OcrLine) -> float:
@@ -105,6 +112,10 @@ def group_into_rows(lines: List[OcrLine], y_tolerance: float = 15) -> List[Tuple
     def x_left(line: OcrLine) -> float:
         xs = [p[0] for p in line.bbox]
         return min(xs) if xs else 0.0
+
+    if y_tolerance is None:
+        heights = sorted(max(p[1] for p in l.bbox) - min(p[1] for p in l.bbox) for l in lines if l.bbox)
+        y_tolerance = ROW_TOLERANCE_FACTOR * heights[len(heights) // 2] if heights else 0.0
 
     rows: List[List[OcrLine]] = []
     for line in sorted(lines, key=y_center):
