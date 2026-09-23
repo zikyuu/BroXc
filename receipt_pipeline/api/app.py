@@ -18,7 +18,11 @@ from pydantic import BaseModel
 from ..matcher import run_matching
 from ..receipts.tag_store import TagStore
 from ..shared.db import ledger
-from ..shared.db.database import DEFAULT_DB_PATH, connect, save_receipt
+from ..shared.db.database import (
+    DEFAULT_DB_PATH, classify_transaction, connect, create_trip, get_active_trip, save_receipt,
+    set_active_trip, set_receipt_trip, set_transaction_trip,
+)
+from ..types import SplitMode, TransactionType
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
@@ -66,15 +70,32 @@ def _save_upload(upload: UploadFile) -> str:
 # ---- reading ----
 
 @app.get("/api/overview")
-def overview(start: Optional[str] = None, end: Optional[str] = None):
+def overview(start: Optional[str] = None, end: Optional[str] = None, trip_id: Optional[int] = None):
     with db() as conn:
-        return {"status": ledger.status(conn), "summary": ledger.summary(conn, start, end)}
+        active = get_active_trip(conn)
+        return {
+            "status": ledger.status(conn),
+            "summary": ledger.summary(conn, start, end, trip_id),
+            "active_trip": {"id": active.id, "name": active.name} if active else None,
+        }
 
 
 @app.get("/api/items")
-def items(start: Optional[str] = None, end: Optional[str] = None):
+def items(start: Optional[str] = None, end: Optional[str] = None, trip_id: Optional[int] = None):
     with db() as conn:
-        return ledger.list_items(conn, start, end)
+        return ledger.list_items(conn, start, end, trip_id)
+
+
+@app.get("/api/reimbursements")
+def reimbursements():
+    with db() as conn:
+        return ledger.reimbursement_summary(conn)
+
+
+@app.get("/api/trips")
+def trips():
+    with db() as conn:
+        return ledger.trip_summaries(conn)
 
 
 @app.get("/api/tags")
@@ -114,6 +135,92 @@ def change_tags(change: TagChange):
     for name, item_tags in updated:
         store.record_correction(name, item_tags)  # next receipt with this item starts with these tags
     return {"updated": len(updated)}
+
+
+class ShareIn(BaseModel):
+    person: str
+    amount: Optional[float] = None
+    percentage: Optional[float] = None
+
+
+class SplitChange(BaseModel):
+    item_ids: List[int]
+    mode: SplitMode
+    shares: List[ShareIn] = []
+
+
+@app.post("/api/items/split")
+def change_split(change: SplitChange):
+    """Mark items as mine / paid for someone else / shared. Paid-for-others amounts feed the
+    reimbursement balance instead of personal spend."""
+    with db() as conn:
+        try:
+            changed = ledger.set_split(conn, change.item_ids, change.mode, [s.model_dump() for s in change.shares])
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    return {"updated": changed}
+
+
+class TripCreate(BaseModel):
+    name: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    activate: bool = False
+
+
+@app.post("/api/trips")
+def new_trip(trip: TripCreate):
+    if not trip.name.strip():
+        raise HTTPException(400, "A trip needs a name.")
+    with db() as conn:
+        return {"id": create_trip(conn, trip.name.strip(), trip.start_date, trip.end_date, trip.activate)}
+
+
+@app.post("/api/trips/{trip_id}/activate")
+def activate_trip(trip_id: int):
+    """Trip Mode on: new receipts and expense transactions auto-join this trip (only one is active)."""
+    with db() as conn:
+        set_active_trip(conn, trip_id)
+    return {"ok": True}
+
+
+@app.post("/api/trips/deactivate")
+def deactivate_trip():
+    with db() as conn:
+        set_active_trip(conn, None)
+    return {"ok": True}
+
+
+class TripAssign(BaseModel):
+    trip_id: Optional[int] = None  # null removes it from its trip
+
+
+@app.post("/api/receipts/{receipt_id}/trip")
+def assign_receipt_trip(receipt_id: int, request: TripAssign):
+    with db() as conn:
+        set_receipt_trip(conn, receipt_id, request.trip_id)
+    return {"ok": True}
+
+
+@app.post("/api/transactions/{transaction_id}/trip")
+def assign_transaction_trip(transaction_id: int, request: TripAssign):
+    with db() as conn:
+        set_transaction_trip(conn, transaction_id, request.trip_id)
+    return {"ok": True}
+
+
+class Classification(BaseModel):
+    type: TransactionType
+    refunds_receipt_id: Optional[int] = None
+
+
+@app.post("/api/transactions/{transaction_id}/classify")
+def classify(transaction_id: int, request: Classification):
+    """Reclassify a transaction, e.g. an incoming credit as a reimbursement. Non-expenses leave
+    the receipt matcher and personal spend."""
+    with db() as conn:
+        classify_transaction(conn, transaction_id, request.type, request.refunds_receipt_id)
+    return {"ok": True}
 
 
 class LinkRequest(BaseModel):

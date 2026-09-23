@@ -4,7 +4,7 @@
    server goes through api()/post() below, so swapping the backend later (e.g. for a database
    that runs in the browser) only touches those two functions. */
 
-const UNTAGGED = 'Untagged';
+const UNTAGGED = 'Unsorted';
 const $ = (selector, root = document) => root.querySelector(selector);
 
 // Element builder. Text always goes in as text nodes, never HTML: receipt text comes from OCR and can't be trusted.
@@ -99,7 +99,7 @@ async function refresh() {
   ]);
   Object.assign(state, { overview, items, allTags, transactions });
 
-  // keep only selections you can still see: after tagging inside a filter (say "Untagged"),
+  // keep only selections you can still see: after tagging inside a filter (say "Unsorted"),
   // the items you just tagged drop out of view, and a hidden selection is a trap
   const visible = new Set(visibleItems().map((i) => i.id));
   state.selected = new Set([...state.selected].filter((id) => visible.has(id)));

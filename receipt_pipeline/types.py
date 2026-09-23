@@ -22,6 +22,19 @@ class SplitMode(Enum):
     SHARED = "shared"      # split across multiple people, see Lineitem.shares
 
 
+class TransactionType(Enum):
+    '''what kind of money movement a YouTrip transaction actually is — only an EXPENSE is a
+    purchase eligible for receipt matching; the rest describe cash moving for other reasons
+    and must never enter personal spending totals or the receipt matcher'''
+
+    EXPENSE = "expense"                        # default — an actual purchase
+    REIMBURSEMENT = "reimbursement"             # incoming money reducing what's owed back to the user
+    INCOME = "income"                           # incoming money that isn't a reimbursement (allowance, etc.)
+    REFUND = "refund"                           # incoming money reversing an earlier personal expense
+    TRANSFER_OWN_ACCOUNT = "transfer_own_account"  # cash movement between the user's own accounts — neither spending nor income
+    OTHER = "other"
+
+
 @dataclass
 class SplitShare:
     '''one person's portion of a SHARED line item. Set exactly one of amount/percentage.'''
@@ -64,6 +77,7 @@ class ReceiptDraft:
     ocr_confidence: Optional[float] = None
     raw_text: Optional[str] = None
     source_image_path: Optional[str] = None
+    trip_id: Optional[int] = None  # auto-filled from whichever trip has Trip Mode on, when saved; removable, not a hard rule
 
 
 @dataclass
@@ -76,3 +90,18 @@ class YouTripTransaction:
     local_amount: Optional[float] = None  # what the merchant actually charged (e.g. 10.00), shown beside the SGD figure on the row
     local_currency: Optional[str] = None  # e.g. "SEK"
     matched_receipt_path: Optional[str] = None  # filled in once the matcher runs, still None until then
+    transaction_type: TransactionType = TransactionType.EXPENSE
+    trip_id: Optional[int] = None  # auto-filled from whichever trip has Trip Mode on, when saved
+    refunds_receipt_id: Optional[int] = None  # only set when transaction_type is REFUND — which expense this reverses
+
+
+@dataclass
+class Trip:
+    '''a trip is a context/tag, not a spending category — the same transaction can be both
+    Food -> Eat Out and "Tallinn Trip" at once, see Trip Mode'''
+
+    id: Optional[int] = None
+    name: str = ""
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    is_active: bool = False  # whether Trip Mode is currently on for this trip — new transactions auto-tag while true

@@ -15,8 +15,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from receipt_pipeline.receipts.tag_store import TagStore
-from receipt_pipeline.shared.db.database import connect, record_match, save_receipt, save_youtrip_transaction
-from receipt_pipeline.types import Lineitem, ReceiptDraft, YouTripTransaction
+from receipt_pipeline.shared.db.database import (
+    classify_transaction, connect, create_trip, record_match, save_receipt, save_youtrip_transaction,
+    set_receipt_trip, set_transaction_trip,
+)
+from receipt_pipeline.shared.db.ledger import set_split
+from receipt_pipeline.types import Lineitem, ReceiptDraft, SplitMode, TransactionType, YouTripTransaction
 
 DB, TAGS = Path("demo.db"), Path("demo_tag_store.json")
 for path in (DB, TAGS):
@@ -85,6 +89,19 @@ charge(16, "RESTAURANT ZUR LINDE", 60.00, 40.00, "EUR")  # no receipt
 record_match(conn, t_cafe, r_cafe, "needs_review", "exchange rate 0.57 EUR/SGD is 15% off the usual 0.67")
 record_match(conn, t_bakery, r_bakery, "auto")
 record_match(conn, t_shop, r_shop, "auto")
+
+# ---- trip mode + paid-for-others: Berlin is a trip (a context tag, separate from categories), the
+# Cafe Roma lunch was split with a friend, and the friend has paid part of it back ----
+berlin = create_trip(conn, "Berlin weekend", (today - timedelta(days=16)).isoformat(), (today - timedelta(days=14)).isoformat())
+for receipt_id in (r_cafe, r_bakery, r_shop):
+    set_receipt_trip(conn, receipt_id, berlin)
+for transaction_id in (t_cafe, t_bakery, t_shop):
+    set_transaction_trip(conn, transaction_id, berlin)
+
+lunch_item = conn.execute("SELECT id FROM line_items WHERE receipt_id = ?", (r_cafe,)).fetchone()[0]
+set_split(conn, [lunch_item], SplitMode.SHARED, [{"person": "me", "percentage": 50}, {"person": "Sam", "percentage": 50}])
+paid_back = charge(10, "FROM SAM", 30.00, None, None)
+classify_transaction(conn, paid_back, TransactionType.REIMBURSEMENT)
 
 # ---- corrections the tag store has learned, so tag suggestions have something to draw on ----
 store = TagStore(TAGS)
