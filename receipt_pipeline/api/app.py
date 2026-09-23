@@ -22,6 +22,18 @@ from ..shared.db.database import DEFAULT_DB_PATH, connect, save_receipt
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """StaticFiles, but tells the browser to always revalidate before reusing a cached copy.
+    Without this, editing app.js/styles.css/index.html can silently keep serving an already-
+    fixed-on-disk file until the browser's cache is manually cleared — a real dev-loop trap,
+    not hypothetical (hit this exact thing debugging a syntax error)."""
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app = FastAPI(title="Expense tracker")
 
 
@@ -177,4 +189,4 @@ def upload_youtrip(screenshot: UploadFile = File(...)):
 
 
 # static frontend last, so it never shadows an /api route
-app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
