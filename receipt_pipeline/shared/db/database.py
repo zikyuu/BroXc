@@ -12,8 +12,10 @@ now; a shares table can be added once there's something to actually populate it.
 """
 
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Tuple
+from statistics import median
+from typing import Dict, List, Optional, Tuple
 
 from ...types import ReceiptDraft,ReviewStatus, YouTripTransaction
 
@@ -64,9 +66,34 @@ CREATE TABLE IF NOT EXISTS youtrip_transactions (
     date TEXT,
     description TEXT,
     amount_sgd REAL,
-    matched_receipt_id INTEGER REFERENCES receipts(id)
+    local_amount REAL,
+    local_currency TEXT,
+    matched_receipt_id INTEGER REFERENCES receipts(id),
+    match_status TEXT,
+    match_note TEXT
 );
 """
+
+# Columns added after the first version of the schema. CREATE TABLE IF NOT EXISTS never alters a
+# table that already exists, so a database created earlier gets these added by _migrate instead.
+MIGRATIONS = {
+    "receipts": {"merchant_original": "TEXT"},
+    "youtrip_transactions": {
+        "local_amount": "REAL",
+        "local_currency": "TEXT",
+        "match_status": "TEXT",  # auto (matcher was confident) | needs_review | approved (a human said yes)
+        "match_note": "TEXT",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, sql_type in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+    conn.commit()
 
 
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -74,10 +101,11 @@ def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
-def _get_or_create_tag_id(conn: sqlite3.Connection, tag_name: str) -> int:
+def get_or_create_tag_id(conn: sqlite3.Connection, tag_name: str) -> int:
     conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag_name,))
     row = conn.execute("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
     return row[0]
@@ -114,7 +142,7 @@ def save_receipt(conn: sqlite3.Connection, draft: ReceiptDraft) -> int:
         item_id = item_cursor.lastrowid
 
         for tag_name in item.tags:
-            tag_id = _get_or_create_tag_id(conn, tag_name)
+            tag_id = get_or_create_tag_id(conn, tag_name)
             conn.execute(
                 "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)",
                 (item_id, tag_id),
@@ -127,8 +155,14 @@ def save_receipt(conn: sqlite3.Connection, draft: ReceiptDraft) -> int:
 def save_youtrip_transaction(conn: sqlite3.Connection, transaction: YouTripTransaction) -> int:
     """Persists one YouTripTransaction, returns its new id."""
     cursor = conn.execute(
-        "INSERT INTO youtrip_transactions (date, description, amount_sgd) VALUES (?, ?, ?)",
-        (transaction.date, transaction.description, transaction.amount_sgd),
+        """
+        INSERT INTO youtrip_transactions (date, description, amount_sgd, local_amount, local_currency)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            transaction.date, transaction.description, transaction.amount_sgd,
+            transaction.local_amount, transaction.local_currency,
+        ),
     )
     conn.commit()
     return cursor.lastrowid
@@ -182,18 +216,53 @@ def get_unmatched_receipts(conn: sqlite3.Connection) -> List[Tuple[int, ReceiptD
 def get_unmatched_transactions(conn: sqlite3.Connection) -> List[Tuple[int, YouTripTransaction]]:
     """YouTrip transactions not yet linked to a receipt."""
     rows = conn.execute(
-        "SELECT id, date, description, amount_sgd FROM youtrip_transactions WHERE matched_receipt_id IS NULL"
+        """
+        SELECT id, date, description, amount_sgd, local_amount, local_currency
+        FROM youtrip_transactions WHERE matched_receipt_id IS NULL
+        """
     ).fetchall()
     return [
-        (row[0], YouTripTransaction(date=row[1], description=row[2], amount_sgd=row[3]))
+        (
+            row[0],
+            YouTripTransaction(
+                date=row[1], description=row[2], amount_sgd=row[3],
+                local_amount=row[4], local_currency=row[5],
+            ),
+        )
         for row in rows
     ]
 
 
-def record_match(conn: sqlite3.Connection, transaction_id: int, receipt_id: int) -> None:
-    """Links a YouTrip transaction to the receipt the matcher decided it corresponds to."""
+def record_match(
+    conn: sqlite3.Connection,
+    transaction_id: int,
+    receipt_id: int,
+    match_status: str = "auto",
+    match_note: Optional[str] = None,
+) -> None:
+    """Links a YouTrip transaction to a receipt. match_status is 'auto' when the matcher was
+    confident, 'needs_review' when it linked but wants a human to look, 'approved' once one has."""
     conn.execute(
-        "UPDATE youtrip_transactions SET matched_receipt_id = ? WHERE id = ?",
-        (receipt_id, transaction_id),
+        "UPDATE youtrip_transactions SET matched_receipt_id = ?, match_status = ?, match_note = ? WHERE id = ?",
+        (receipt_id, match_status, match_note, transaction_id),
     )
     conn.commit()
+
+
+def get_reference_rates(conn: sqlite3.Connection, min_samples: int = 3) -> Dict[str, float]:
+    """The usual local-currency-per-SGD rate for each currency, taken from YouTrip's own charges
+    (the median of local_amount / amount_sgd). A currency needs min_samples transactions before
+    it gets a rate, since a median of one or two isn't a baseline anything can be an outlier against."""
+    rows = conn.execute(
+        """
+        SELECT local_currency, local_amount / amount_sgd
+        FROM youtrip_transactions
+        WHERE local_amount > 0 AND amount_sgd > 0 AND local_currency IS NOT NULL
+        """
+    ).fetchall()
+
+    rates_by_currency: Dict[str, List[float]] = defaultdict(list)
+    for currency, rate in rows:
+        rates_by_currency[currency.upper()].append(rate)
+
+    return {c: median(rates) for c, rates in rates_by_currency.items() if len(rates) >= min_samples}

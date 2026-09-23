@@ -12,7 +12,7 @@ keyword.
 """
 
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from ..shared.ocr.engine import group_into_rows, run_ocr
 from ..types import YouTripTransaction
@@ -31,6 +31,23 @@ _DIGIT_LOOKALIKES = str.maketrans({
 })
 
 LOCAL_AMOUNT_PATTERN = re.compile(r"kr([A-Za-z0-9]+\.\d{2})\s*SEK", re.IGNORECASE)
+
+# what the merchant actually charged, shown next to the SGD figure: "kr10.00 SEK", "€50.00 EUR"
+LOCAL_CHARGE_PATTERN = re.compile(r"(?:kr|€|£|\$)?\s*(\d+[.,]\d{2})\s*(SEK|EUR|NOK|DKK|GBP|USD)\b", re.IGNORECASE)
+
+
+def _split_local_charge(description: Optional[str]) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """Moves the local-currency charge out of the description into its own value, so the matcher
+    can compare it against a receipt total. Returns (amount, currency, cleaned description)."""
+    if not description:
+        return None, None, description
+    match = LOCAL_CHARGE_PATTERN.search(description)
+    if not match:
+        return None, None, description
+    amount = float(match.group(1).replace(",", "."))
+    remainder = description[:match.start()] + " " + description[match.end():]
+    cleaned = re.sub(r"\s+", " ", remainder).strip(" -,$\t") or None
+    return amount, match.group(2).upper(), cleaned
 
 
 def _fix_local_amount(text: str) -> str:
@@ -81,10 +98,13 @@ def parse_youtrip_screenshot(
                 pending_description_parts.append(leftover)
 
             description = " ".join(pending_description_parts).strip(" -,\t") or None
+            local_amount, local_currency, description = _split_local_charge(description)
             transactions.append(YouTripTransaction(
                 date=current_date,
                 description=description,
                 amount_sgd=sgd_amount,
+                local_amount=local_amount,
+                local_currency=local_currency,
             ))
             pending_description_parts = []
             continue
