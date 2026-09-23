@@ -11,10 +11,17 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from ..dates import parse_date
-from ...types import YouTripTransaction
+from ...types import ReviewStatus, YouTripTransaction
 from .database import get_or_create_tag_id, get_reference_rates, record_match
 
 UNTAGGED = "Untagged"  # the bucket shown for items with no tags; not a real tag
+# shortest individual word from a known merchant's name allowed to trigger a category guess.
+# Fuzzy character-alignment scoring (rapidfuzz's partial_ratio) was tried first and produced
+# real false positives against real data - "SL" scored 66.7 against "SYSTEMBOLAGET UPPSALA"
+# purely by coincidence, and even a full name like "Large coop" scored 60 against it too, both
+# well above any threshold that still caught genuine matches. A literal substring check on
+# individual words doesn't have that failure mode.
+MIN_HINT_WORD_LENGTH = 4
 
 
 def _receipt_rates(conn: sqlite3.Connection) -> Dict[int, Tuple[Optional[float], Optional[str]]]:
@@ -39,6 +46,48 @@ def _receipt_rates(conn: sqlite3.Connection) -> Dict[int, Tuple[Optional[float],
         else:
             rates[receipt_id] = (None, None)
     return rates
+
+
+def _merchant_category_hints(conn: sqlite3.Connection) -> Dict[str, str]:
+    """merchant name -> its single most common tag, learned from that merchant's own past
+    receipts. Powers a best-effort category guess for a charge with no receipt at all. Indexes
+    by both the translated and original-language merchant name (same reasoning as the matcher's
+    own name comparison), since YouTrip's description is in the original language and a
+    translated name alone can score poorly against it even for a genuine match."""
+    rows = conn.execute(
+        """
+        SELECT r.merchant, r.merchant_original, t.name, COUNT(*) as n
+        FROM receipts r
+        JOIN line_items li ON li.receipt_id = r.id
+        JOIN item_tags it ON it.item_id = li.id
+        JOIN tags t ON t.id = it.tag_id
+        WHERE r.merchant IS NOT NULL OR r.merchant_original IS NOT NULL
+        GROUP BY r.merchant, r.merchant_original, t.name
+        ORDER BY r.merchant, n DESC
+        """
+    ).fetchall()
+    hints: Dict[str, str] = {}
+    for merchant, merchant_original, tag, _ in rows:
+        for name in (merchant, merchant_original):
+            if name:
+                hints.setdefault(name, tag)  # first row per name is its highest-count tag, since ORDER BY put n DESC within each merchant
+    return hints
+
+
+def _infer_category(description: Optional[str], merchant_hints: Dict[str, str]) -> Optional[str]:
+    """Best-effort tag guess for a transaction with no receipt: does any individual word from a
+    merchant we've already learned tags for appear literally inside this description? A literal
+    substring check, not a fuzzy score — prefers the longest matching word when several merchants'
+    names share a short one, and returns None (an honest "don't know") rather than force a guess."""
+    if not description or not merchant_hints:
+        return None
+    text = description.lower()
+    best_tag, best_word_len = None, 0
+    for merchant, tag in merchant_hints.items():
+        for word in merchant.lower().split():
+            if len(word) >= MIN_HINT_WORD_LENGTH and word in text and len(word) > best_word_len:
+                best_tag, best_word_len = tag, len(word)
+    return best_tag
 
 
 def _all_items(conn: sqlite3.Connection) -> List[dict]:
@@ -73,12 +122,41 @@ def _all_items(conn: sqlite3.Connection) -> List[dict]:
             "price_sgd": round(price / rate, 2) if rate else None,
             "sgd_source": source,
             "tags": tags_by_item.get(item_id, []),
+            "tag_confidence": "confirmed",
             "receipt": {
                 "id": receipt_id,
                 "merchant": merchant,
                 "date": parsed.isoformat() if parsed else None,
             },
         })
+
+    # transactions with no receipt at all get no line_items row to read from — without this,
+    # that money is invisible in every spending total even though it genuinely left the card
+    merchant_hints = _merchant_category_hints(conn)
+    unmatched = conn.execute(
+        "SELECT id, date, description, amount_sgd FROM youtrip_transactions WHERE matched_receipt_id IS NULL"
+    ).fetchall()
+    for t_id, raw_date, description, amount_sgd in unmatched:
+        parsed = parse_date(raw_date)
+        inferred = _infer_category(description, merchant_hints)
+        items.append({
+            "id": -t_id,  # negative space marks a transaction with no backing receipt yet, distinct from real line_items ids
+            "name": description or "Unknown charge",
+            "quantity": 1,
+            "is_deposit": False,
+            "price": amount_sgd,
+            "currency": "SGD",
+            "price_sgd": amount_sgd,  # already SGD - this is what YouTrip actually charged, no conversion needed
+            "sgd_source": "native",
+            "tags": [inferred] if inferred else [],
+            "tag_confidence": "inferred" if inferred else "unknown",
+            "receipt": {
+                "id": None,
+                "merchant": "No receipt yet",
+                "date": parsed.isoformat() if parsed else None,
+            },
+        })
+
     return items
 
 
@@ -163,6 +241,33 @@ def _clean_tags(tags: List[str]) -> List[str]:
     return cleaned
 
 
+def _resolve_transaction_as_manual_receipt(conn: sqlite3.Connection, transaction_id: int) -> int:
+    """Turns a receipt-less transaction into a matched one backed by a minimal, hand-entered
+    receipt, the moment a user tags it directly from the Spending tab. Reuses the same idea as
+    a personal-transfer breakdown (a transaction can be enriched by a manually-typed receipt,
+    not just an OCR'd one) - just triggered by tagging instead of an explicit "add details" step.
+    Returns the id of the one line item created, so the caller can tag that."""
+    row = conn.execute(
+        "SELECT date, description, amount_sgd, local_amount, local_currency FROM youtrip_transactions WHERE id = ?",
+        (transaction_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"no transaction with id {transaction_id}")
+    date, description, amount_sgd, local_amount, local_currency = row
+
+    cursor = conn.execute(
+        "INSERT INTO receipts (merchant, date, currency, total, status) VALUES (?, ?, ?, ?, ?)",
+        (description, date, local_currency or "SGD", local_amount or amount_sgd, ReviewStatus.CONFIRMED.value),
+    )
+    receipt_id = cursor.lastrowid
+    item_cursor = conn.execute(
+        "INSERT INTO line_items (receipt_id, name, price, quantity, is_deposit, split_mode) VALUES (?, ?, ?, 1, 0, 'mine')",
+        (receipt_id, description or "Unknown charge", local_amount or amount_sgd),
+    )
+    record_match(conn, transaction_id, receipt_id, match_status="approved", match_note="resolved by tagging from Spending")
+    return item_cursor.lastrowid
+
+
 def apply_tag_changes(
     conn: sqlite3.Connection, item_ids: List[int], add: List[str], remove: List[str]
 ) -> List[Tuple[str, List[str]]]:
@@ -171,6 +276,8 @@ def apply_tag_changes(
     add, remove = _clean_tags(add), _clean_tags(remove)
     updated = []
     for item_id in item_ids:
+        if item_id < 0:
+            item_id = _resolve_transaction_as_manual_receipt(conn, -item_id)
         row = conn.execute("SELECT name FROM line_items WHERE id = ?", (item_id,)).fetchone()
         if not row:
             continue

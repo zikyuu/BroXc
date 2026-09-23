@@ -207,6 +207,7 @@ function visibleItems() {
 
 function itemRow(item) {
   const selected = state.selected.has(item.id);
+  const noReceipt = item.receipt.id == null;
   const meta = [item.receipt.merchant, shortDate(item.receipt.date), item.is_deposit && 'deposit, not counted'].filter(Boolean).join(' · ');
   return h('div', { class: `item${selected ? ' selected' : ''}`, 'data-id': item.id },
     h('input', { type: 'checkbox', checked: selected, 'aria-label': `Select ${item.name}`, onchange: (e) => toggleSelected(item.id, e.target.checked) }),
@@ -219,13 +220,15 @@ function itemRow(item) {
         renderSpending();
       },
     }, priceLabel(item)),
-    h('div', { class: 'meta' }, meta),
+    h('div', { class: `meta${noReceipt ? ' unmatched' : ''}` }, meta),
     h('div', { class: 'tags' }, item.tags.length
       ? item.tags.map((tag) => h('button', {
-          class: `chip tag${tag === 'mystery' ? ' mystery' : ''}`, title: `Show only “${tag}”`,
+          class: `chip tag${tag === 'mystery' ? ' mystery' : ''}${item.tag_confidence === 'inferred' ? ' inferred' : ''}`,
+          title: item.tag_confidence === 'inferred' ? `Guessed from past charges at this merchant, not confirmed — tap to check` : `Show only “${tag}”`,
           onclick: () => { state.tag = tag; renderSpending(); },
-        }, tag))
-      : h('span', { class: 'muted small' }, 'No tags yet')));
+        }, tag, item.tag_confidence === 'inferred' && h('span', { class: 'confidence-mark' }, ' ?')))
+      : h('span', { class: 'muted small' }, 'No tags yet'),
+    noReceipt && h('span', { class: 'chip tag unmatched-note' }, 'tap to tag — this will create a minimal receipt for it')));
 }
 
 function itemsCard() {

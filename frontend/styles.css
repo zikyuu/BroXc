@@ -127,6 +127,9 @@ main { padding: 16px 16px 120px; }
 .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .chip.tag { font-weight: 500; padding: 3px 10px; }
 .chip.tag.mystery { border-style: dashed; }
+.chip.tag.inferred { border-style: dashed; color: var(--warn-ink); border-color: var(--warn-ink); }
+.chip.tag.unmatched-note { border-style: dashed; font-weight: 400; cursor: default; }
+.confidence-mark { font-weight: 700; }
 
 .btn {
   border: 1px solid var(--line);
@@ -208,6 +211,7 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .item input[type="checkbox"] { width: 18px; height: 18px; margin-top: 3px; accent-color: var(--accent); }
 .item .name { font-weight: 600; overflow-wrap: anywhere; }
 .item .meta { grid-column: 2; color: var(--muted); font-size: 13px; }
+.item .meta.unmatched { font-style: italic; }
 .item .tags { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
 .item .price {
   grid-column: 3;
