@@ -17,9 +17,10 @@ from typing import Dict, List, Optional, Tuple
 
 from ..dates import parse_date
 from ...types import ReviewStatus, SplitMode, TransactionType, YouTripTransaction
+from . import categories as cats
 from .database import (
-    get_or_create_tag_id, get_reference_rates, last_balance_checkpoint, record_balance_checkpoint,
-    record_match, save_youtrip_transaction,
+    classify_transaction, get_or_create_tag_id, get_reference_rates, last_balance_checkpoint, list_balance_checkpoints,
+    record_balance_checkpoint, record_match, save_youtrip_transaction,
 )
 
 UNSORTED = "Unsorted"  # the bucket shown for items with no tags yet - a real item whose category isn't resolved, not a real tag
@@ -115,8 +116,43 @@ def _split_price(price: float, split_mode: str, shares: List[Tuple[str, Optional
     return price, 0.0, False
 
 
+def _category_fields(category: Optional[dict], confidence: str) -> dict:
+    """The category part of an item dict. confidence: confirmed (the user put it there) | suggested
+    (derived from tags/merchant history - a guess) | unknown (nothing to go on)."""
+    return {
+        "category_id": category["id"] if category else None,
+        "category_path": category["path"] if category else [],
+        "category_path_ids": category["path_ids"] if category else [],
+        "category_root_id": category["root_id"] if category else None,
+        "category_color": category["effective_color"] if category else None,
+        "category_icon": category["icon"] if category else None,
+        "category_confidence": confidence,
+    }
+
+
+def _resolve_category(category_id, tags, itemised, index, lookup):
+    """(category, confidence) for one item. An explicit category_id always wins. Otherwise the deepest
+    category named by its tags is a suggestion. An item with no itemised receipt behind it that lands on
+    a category with a Grocery Shopping bucket goes into that bucket: it's a known grocery spend that
+    can't be split into meat/veg/etc. until a receipt turns up."""
+    category, confidence = None, "unknown"
+    if category_id in index:
+        category, confidence = index[category_id], "confirmed"
+    else:
+        inferred = cats.infer_from_tags(tags, lookup)
+        if inferred is not None:
+            category, confidence = index[inferred], "suggested"
+    if category and not itemised:
+        grocery = cats.grocery_child(category, index)
+        if grocery:
+            category = grocery
+    return category, confidence
+
+
 def _all_items(conn: sqlite3.Connection) -> List[dict]:
     rates = _receipt_rates(conn)
+    index = cats.category_index(conn)
+    lookup = cats.name_lookup(index)
 
     tags_by_item: Dict[int, List[str]] = defaultdict(list)
     for item_id, name in conn.execute(
@@ -131,21 +167,30 @@ def _all_items(conn: sqlite3.Connection) -> List[dict]:
         shares_by_item[item_id].append((person, amount, percentage))
 
     trip_names = {trip_id: name for trip_id, name in conn.execute("SELECT id, name FROM trips")}
+    transaction_for_receipt = {
+        receipt_id: (t_id, match_status) for receipt_id, t_id, match_status in conn.execute(
+            "SELECT matched_receipt_id, id, match_status FROM youtrip_transactions WHERE matched_receipt_id IS NOT NULL"
+        )
+    }
 
     rows = conn.execute(
         """
-        SELECT li.id, li.name, li.price, li.quantity, li.is_deposit, li.split_mode,
-               r.id, r.merchant, r.date, r.currency, r.trip_id
+        SELECT li.id, li.name, li.price, li.quantity, li.is_deposit, li.split_mode, li.category_id,
+               r.id, r.merchant, r.date, r.currency, r.trip_id, r.raw_text, r.source_image_path
         FROM line_items li JOIN receipts r ON r.id = li.receipt_id
         ORDER BY r.date DESC, li.id
         """
     ).fetchall()
 
     items = []
-    for item_id, name, price, quantity, is_deposit, split_mode, receipt_id, merchant, raw_date, currency, trip_id in rows:
+    for (item_id, name, price, quantity, is_deposit, split_mode, category_id,
+         receipt_id, merchant, raw_date, currency, trip_id, raw_text, source_image) in rows:
         parsed = parse_date(raw_date)
         rate, source = rates.get(receipt_id, (None, None))
         personal, others, unresolved = _split_price(price, split_mode, shares_by_item.get(item_id, []))
+        itemised = bool(raw_text or source_image)  # read off a real receipt, vs. typed in by hand
+        category, confidence = _resolve_category(category_id, tags_by_item.get(item_id, []), itemised, index, lookup)
+        transaction_id, match_status = transaction_for_receipt.get(receipt_id, (None, None))
         items.append({
             "id": item_id,
             "name": name,
@@ -161,12 +206,16 @@ def _all_items(conn: sqlite3.Connection) -> List[dict]:
             "others_sgd": round(others / rate, 2) if rate else None,
             "sgd_source": source,
             "tags": tags_by_item.get(item_id, []),
-            "tag_confidence": "confirmed",
+            "tag_confidence": {"confirmed": "confirmed", "suggested": "inferred", "unknown": "unknown"}[confidence],
+            "itemised": itemised,
+            **_category_fields(category, confidence),
             "trip": {"id": trip_id, "name": trip_names.get(trip_id)} if trip_id else None,
+            "match_status": match_status,
             "receipt": {
                 "id": receipt_id,
                 "merchant": merchant,
                 "date": parsed.isoformat() if parsed else None,
+                "transaction_id": transaction_id,
             },
         })
 
@@ -183,6 +232,7 @@ def _all_items(conn: sqlite3.Connection) -> List[dict]:
     for t_id, raw_date, description, amount_sgd, trip_id in unmatched:
         parsed = parse_date(raw_date)
         inferred = _infer_category(description, merchant_hints)
+        category, confidence = _resolve_category(None, [inferred] if inferred else [], False, index, lookup)
         items.append({
             "id": -t_id,  # negative space marks a transaction with no backing receipt yet, distinct from real line_items ids
             "name": description or "Unknown charge",
@@ -198,12 +248,16 @@ def _all_items(conn: sqlite3.Connection) -> List[dict]:
             "others_sgd": 0.0,
             "sgd_source": "native",
             "tags": [inferred] if inferred else [],
-            "tag_confidence": "inferred" if inferred else "unknown",
+            "tag_confidence": {"confirmed": "confirmed", "suggested": "inferred", "unknown": "unknown"}[confidence],
+            "itemised": False,
+            **_category_fields(category, confidence),
             "trip": {"id": trip_id, "name": trip_names.get(trip_id)} if trip_id else None,
+            "match_status": None,
             "receipt": {
                 "id": None,
                 "merchant": "No receipt yet",
                 "date": parsed.isoformat() if parsed else None,
+                "transaction_id": t_id,
             },
         })
 
@@ -306,17 +360,32 @@ def _clean_tags(tags: List[str]) -> List[str]:
 
 def _resolve_transaction_as_manual_receipt(conn: sqlite3.Connection, transaction_id: int) -> int:
     """Turns a receipt-less transaction into a matched one backed by a minimal, hand-entered
-    receipt, the moment a user tags it directly from the Spending tab. Reuses the same idea as
+    receipt, the moment a user tags/categorises/splits it directly. Reuses the same idea as
     a personal-transfer breakdown (a transaction can be enriched by a manually-typed receipt,
-    not just an OCR'd one) - just triggered by tagging instead of an explicit "add details" step.
-    Returns the id of the one line item created, so the caller can tag that."""
+    not just an OCR'd one) - just triggered by the edit instead of an explicit "add details" step.
+    If the transaction already has a receipt, its first line item is returned instead.
+    Returns the id of the one line item, so the caller can edit that."""
     row = conn.execute(
-        "SELECT date, description, amount_sgd, local_amount, local_currency, trip_id FROM youtrip_transactions WHERE id = ?",
+        """
+        SELECT date, description, amount_sgd, local_amount, local_currency, trip_id, matched_receipt_id
+        FROM youtrip_transactions WHERE id = ?
+        """,
         (transaction_id,),
     ).fetchone()
     if not row:
         raise ValueError(f"no transaction with id {transaction_id}")
-    date, description, amount_sgd, local_amount, local_currency, trip_id = row
+    date, description, amount_sgd, local_amount, local_currency, trip_id, matched_receipt_id = row
+
+    if matched_receipt_id is not None:
+        existing = conn.execute(
+            "SELECT id FROM line_items WHERE receipt_id = ? ORDER BY id LIMIT 1", (matched_receipt_id,)
+        ).fetchone()
+        if existing:
+            return existing[0]
+
+    # the category guess this charge was showing (from that merchant's past receipts) must survive
+    # becoming a real item, or tagging its split would silently wipe the suggestion
+    inferred_tag = _infer_category(description, _merchant_category_hints(conn))
 
     cursor = conn.execute(
         "INSERT INTO receipts (merchant, date, currency, total, status, trip_id) VALUES (?, ?, ?, ?, ?, ?)",
@@ -327,8 +396,42 @@ def _resolve_transaction_as_manual_receipt(conn: sqlite3.Connection, transaction
         "INSERT INTO line_items (receipt_id, name, price, quantity, is_deposit, split_mode) VALUES (?, ?, ?, 1, 0, 'mine')",
         (receipt_id, description or "Unknown charge", local_amount or amount_sgd),
     )
-    record_match(conn, transaction_id, receipt_id, match_status="approved", match_note="resolved by tagging from Spending")
+    if inferred_tag:
+        conn.execute(
+            "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)",
+            (item_cursor.lastrowid, get_or_create_tag_id(conn, inferred_tag)),
+        )
+    record_match(conn, transaction_id, receipt_id, match_status="approved", match_note="resolved by editing from the app")
     return item_cursor.lastrowid
+
+
+def assign_category(
+    conn: sqlite3.Connection, item_ids: List[int], category_id: Optional[int], also_similar: bool = False,
+) -> List[Tuple[str, List[str]]]:
+    """Puts items in one category (None clears it, back to whatever the tags suggest). Returns
+    (item name, category path names) per item touched so the caller can teach the tag store.
+    also_similar extends the change to unconfirmed items with the same name - fixing every past
+    'Kyckling' in one go, without ever touching something the user already placed themselves."""
+    if category_id is not None and not conn.execute("SELECT 1 FROM categories WHERE id = ?", (category_id,)).fetchone():
+        raise ValueError("That category doesn't exist.")
+    path = cats.category_index(conn)[category_id]["path"] if category_id is not None else []
+
+    touched: List[Tuple[str, List[str]]] = []
+    for item_id in item_ids:
+        if item_id < 0:
+            item_id = _resolve_transaction_as_manual_receipt(conn, -item_id)
+        row = conn.execute("SELECT name FROM line_items WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            continue
+        conn.execute("UPDATE line_items SET category_id = ? WHERE id = ?", (category_id, item_id))
+        touched.append((row[0], path))
+        if also_similar and category_id is not None:
+            conn.execute(
+                "UPDATE line_items SET category_id = ? WHERE LOWER(name) = LOWER(?) AND category_id IS NULL",
+                (category_id, row[0]),
+            )
+    conn.commit()
+    return touched
 
 
 def apply_tag_changes(
@@ -403,7 +506,8 @@ def list_transactions(conn: sqlite3.Connection) -> List[dict]:
         """
         SELECT t.id, t.date, t.description, t.amount_sgd, t.local_amount, t.local_currency,
                t.matched_receipt_id, t.match_status, t.match_note,
-               r.merchant, r.date, r.total, r.currency, t.transaction_type, t.trip_id, tr.name
+               r.merchant, r.date, r.total, r.currency, t.transaction_type, t.trip_id, tr.name,
+               t.user_note, t.reimbursement_amount
         FROM youtrip_transactions t
         LEFT JOIN receipts r ON r.id = t.matched_receipt_id
         LEFT JOIN trips tr ON tr.id = t.trip_id
@@ -414,7 +518,7 @@ def list_transactions(conn: sqlite3.Connection) -> List[dict]:
     transactions = []
     for (t_id, date, description, amount_sgd, local_amount, local_currency,
          receipt_id, match_status, match_note, r_merchant, r_date, r_total, r_currency,
-         transaction_type, trip_id, trip_name) in rows:
+         transaction_type, trip_id, trip_name, user_note, reimbursement_amount) in rows:
         if transaction_type != TransactionType.EXPENSE.value:
             status = "not_expense"  # never has a receipt, so "unmatched" would wrongly ask for one
         else:
@@ -430,6 +534,8 @@ def list_transactions(conn: sqlite3.Connection) -> List[dict]:
             "trip": {"id": trip_id, "name": trip_name} if trip_id else None,
             "status": status,
             "note": match_note,
+            "user_note": user_note,
+            "reimbursement_amount": reimbursement_amount,
             "receipt": None if receipt_id is None else {
                 "id": receipt_id, "merchant": r_merchant, "date": r_date, "total": r_total, "currency": r_currency,
             },
@@ -534,15 +640,15 @@ def trip_summaries(conn: sqlite3.Connection) -> List[dict]:
         bucket["count"] += 1
 
     trips = conn.execute(
-        "SELECT id, name, start_date, end_date, is_active FROM trips ORDER BY start_date DESC, id DESC"
+        "SELECT id, name, start_date, end_date, is_active, color, emoji FROM trips ORDER BY start_date DESC, id DESC"
     ).fetchall()
     return [
         {
             "id": trip_id, "name": name, "start_date": start_date, "end_date": end_date,
-            "is_active": bool(is_active),
+            "is_active": bool(is_active), "color": color, "emoji": emoji,
             "spend_sgd": round(totals[trip_id]["sgd"], 2), "item_count": totals[trip_id]["count"],
         }
-        for trip_id, name, start_date, end_date, is_active in trips
+        for trip_id, name, start_date, end_date, is_active, color, emoji in trips
     ]
 
 
@@ -559,14 +665,16 @@ def reimbursement_summary(conn: sqlite3.Connection) -> dict:
     items = [i for i in _all_items(conn) if not i["is_deposit"] and (i["others_sgd"] or 0) > 0]
     paid_items = [
         {"id": i["id"], "name": i["name"], "date": i["receipt"]["date"], "merchant": i["receipt"]["merchant"],
-         "others_sgd": i["others_sgd"], "split_mode": i["split_mode"]}
+         "others_sgd": i["others_sgd"], "split_mode": i["split_mode"], "transaction_id": i["receipt"]["transaction_id"],
+         "trip": i["trip"]["name"] if i["trip"] else None}
         for i in items
     ]
     received = [
         {"id": t_id, "date": parse_date(raw_date).isoformat() if parse_date(raw_date) else None,
-         "description": description, "amount_sgd": abs(amount_sgd or 0)}
-        for t_id, raw_date, description, amount_sgd in conn.execute(
-            "SELECT id, date, description, amount_sgd FROM youtrip_transactions WHERE transaction_type = 'reimbursement'"
+         "description": description, "amount_sgd": abs(reimbursement_amount if reimbursement_amount is not None else (amount_sgd or 0)),
+         "total_sgd": abs(amount_sgd or 0)}
+        for t_id, raw_date, description, amount_sgd, reimbursement_amount in conn.execute(
+            "SELECT id, date, description, amount_sgd, reimbursement_amount FROM youtrip_transactions WHERE transaction_type = 'reimbursement'"
         )
     ]
 
@@ -604,4 +712,220 @@ def reimbursement_summary(conn: sqlite3.Connection) -> dict:
             "paid_items": recent_paid,
             "reimbursements": recent_received,
         },
+        # earlier, already-settled periods stay reachable rather than disappearing at each checkpoint
+        "earlier": {
+            "paid_items": [i for i in paid_items if i not in recent_paid],
+            "reimbursements": [r for r in received if r not in recent_received],
+        },
+        "checkpoints": list_balance_checkpoints(conn),
     }
+
+
+def outstanding_excluding(conn: sqlite3.Connection, transaction_id: int) -> float:
+    """What's owed back if this one transaction weren't counted as a reimbursement - the number an
+    incoming payment is checked against, so an over-payment can be caught before it makes the
+    balance negative."""
+    paid = sum(i["others_sgd"] or 0 for i in _all_items(conn) if not i["is_deposit"])
+    received = 0.0
+    for t_id, amount_sgd, reimbursement_amount in conn.execute(
+        "SELECT id, amount_sgd, reimbursement_amount FROM youtrip_transactions WHERE transaction_type = 'reimbursement'"
+    ):
+        if t_id != transaction_id:
+            received += abs(reimbursement_amount if reimbursement_amount is not None else (amount_sgd or 0))
+    return round(paid - received, 2)
+
+
+# ---- single-transaction operations (the detail / split / breakdown screens) ----
+
+def _items_of_transaction(conn: sqlite3.Connection, transaction_id: int) -> List[dict]:
+    return [
+        i for i in _all_items(conn)
+        if i["receipt"]["transaction_id"] == transaction_id or i["id"] == -transaction_id
+    ]
+
+
+def transaction_detail(conn: sqlite3.Connection, transaction_id: int) -> Optional[dict]:
+    transaction = next((t for t in list_transactions(conn) if t["id"] == transaction_id), None)
+    if not transaction:
+        return None
+    items = _items_of_transaction(conn, transaction_id)
+    counted = [i for i in items if not i["is_deposit"]]
+    personal = sum(i["personal_sgd"] or 0 for i in counted)
+    others = sum(i["others_sgd"] or 0 for i in counted)
+    receipt_row = None
+    if transaction["receipt"]:
+        receipt_row = conn.execute(
+            "SELECT raw_text, source_image_path FROM receipts WHERE id = ?", (transaction["receipt"]["id"],)
+        ).fetchone()
+    return {
+        "transaction": transaction,
+        "items": items,
+        "personal_sgd": round(personal, 2),
+        "others_sgd": round(others, 2),
+        # a receipt read off a photo can't be casually replaced by a hand-typed breakdown
+        "can_break_down": transaction["type"] == "expense" and not (receipt_row and (receipt_row[0] or receipt_row[1])),
+        "outstanding_excluding_sgd": outstanding_excluding(conn, transaction_id),
+    }
+
+
+def set_transaction_split(conn: sqlite3.Connection, transaction_id: int, my_share_sgd: float) -> None:
+    """Sets what part of a transaction is the user's own. Applied as the same percentage to every item
+    on it: a $120 dinner with a $30 share makes each item 25% mine. A share of 0 means the whole thing
+    was paid for others, and a share equal to the total clears the split."""
+    row = conn.execute("SELECT amount_sgd, transaction_type FROM youtrip_transactions WHERE id = ?", (transaction_id,)).fetchone()
+    if not row:
+        raise ValueError("No such transaction.")
+    total, kind = row
+    if kind != TransactionType.EXPENSE.value:
+        raise ValueError("Only an expense can be split.")
+    if not total or total <= 0:
+        raise ValueError("This transaction has no amount to split.")
+    if my_share_sgd < -BALANCE_TOLERANCE or my_share_sgd > total + BALANCE_TOLERANCE:
+        raise ValueError(f"Your share has to be between $0 and ${total:.2f}.")
+
+    item_ids = [i["id"] for i in _items_of_transaction(conn, transaction_id)]
+    if not item_ids:
+        return
+    if my_share_sgd >= total - BALANCE_TOLERANCE:
+        set_split(conn, item_ids, SplitMode.MINE)
+    elif my_share_sgd <= BALANCE_TOLERANCE:
+        set_split(conn, item_ids, SplitMode.NOT_MINE)
+    else:
+        mine = round(my_share_sgd / total * 100, 4)
+        set_split(conn, item_ids, SplitMode.SHARED, [
+            {"person": "me", "percentage": mine}, {"person": "Others", "percentage": round(100 - mine, 4)},
+        ])
+
+
+def set_transaction_note(conn: sqlite3.Connection, transaction_id: int, note: Optional[str]) -> None:
+    conn.execute("UPDATE youtrip_transactions SET user_note = ? WHERE id = ?", ((note or "").strip() or None, transaction_id))
+    conn.commit()
+
+
+def _delete_receipt(conn: sqlite3.Connection, receipt_id: int) -> None:
+    item_ids = [r[0] for r in conn.execute("SELECT id FROM line_items WHERE receipt_id = ?", (receipt_id,))]
+    for item_id in item_ids:
+        conn.execute("DELETE FROM item_tags WHERE item_id = ?", (item_id,))
+        conn.execute("DELETE FROM line_item_shares WHERE item_id = ?", (item_id,))
+    conn.execute("DELETE FROM line_items WHERE receipt_id = ?", (receipt_id,))
+    conn.execute("UPDATE youtrip_transactions SET refunds_receipt_id = NULL WHERE refunds_receipt_id = ?", (receipt_id,))
+    conn.execute("DELETE FROM receipts WHERE id = ?", (receipt_id,))
+
+
+def delete_transaction(conn: sqlite3.Connection, transaction_id: int) -> None:
+    """Removes a transaction. A hand-made receipt that existed only to describe it goes too, but a
+    receipt read off a photo is kept - it just becomes an unmatched receipt again."""
+    row = conn.execute(
+        """
+        SELECT t.matched_receipt_id, r.raw_text, r.source_image_path
+        FROM youtrip_transactions t LEFT JOIN receipts r ON r.id = t.matched_receipt_id WHERE t.id = ?
+        """,
+        (transaction_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("No such transaction.")
+    receipt_id, raw_text, source_image = row
+    conn.execute("DELETE FROM youtrip_transactions WHERE id = ?", (transaction_id,))
+    if receipt_id is not None and not (raw_text or source_image):
+        _delete_receipt(conn, receipt_id)
+    conn.commit()
+
+
+def breakdown_transaction(conn: sqlite3.Connection, transaction_id: int, parts: List[dict]) -> None:
+    """Describes one transaction as several categorised amounts, e.g. a $150 Splitwise settlement as
+    Food $50 + Transport $88 + Souvenirs $10, with the rest left Unsorted. The parts are the composition of
+    the same money, so they replace the single item rather than adding to it: the total never changes."""
+    row = conn.execute(
+        """
+        SELECT t.date, t.description, t.amount_sgd, t.trip_id, t.matched_receipt_id, t.transaction_type,
+               r.raw_text, r.source_image_path
+        FROM youtrip_transactions t LEFT JOIN receipts r ON r.id = t.matched_receipt_id WHERE t.id = ?
+        """,
+        (transaction_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("No such transaction.")
+    date, description, amount_sgd, trip_id, receipt_id, kind, raw_text, source_image = row
+    if kind != TransactionType.EXPENSE.value:
+        raise ValueError("Only an expense can be broken down.")
+    if raw_text or source_image:
+        raise ValueError("This transaction already has an itemised receipt, so it doesn't need a manual breakdown.")
+
+    parts = [p for p in parts if (p.get("amount_sgd") or 0) > 0]
+    if not parts:
+        raise ValueError("Add at least one amount.")
+    index = cats.category_index(conn)
+    for part in parts:
+        if part.get("category_id") is not None and part["category_id"] not in index:
+            raise ValueError("One of those categories doesn't exist.")
+    assigned = round(sum(p["amount_sgd"] for p in parts), 2)
+    if assigned > (amount_sgd or 0) + BALANCE_TOLERANCE:
+        raise ValueError(f"Those add up to ${assigned:.2f}, more than the ${(amount_sgd or 0):.2f} charged.")
+
+    if receipt_id is None:
+        cursor = conn.execute(
+            "INSERT INTO receipts (merchant, date, currency, total, status, trip_id) VALUES (?, ?, 'SGD', ?, ?, ?)",
+            (description, date, amount_sgd, ReviewStatus.CONFIRMED.value, trip_id),
+        )
+        receipt_id = cursor.lastrowid
+        record_match(conn, transaction_id, receipt_id, match_status="approved", match_note="broken down by hand")
+    else:
+        for (item_id,) in conn.execute("SELECT id FROM line_items WHERE receipt_id = ?", (receipt_id,)).fetchall():
+            conn.execute("DELETE FROM item_tags WHERE item_id = ?", (item_id,))
+            conn.execute("DELETE FROM line_item_shares WHERE item_id = ?", (item_id,))
+        conn.execute("DELETE FROM line_items WHERE receipt_id = ?", (receipt_id,))
+        conn.execute("UPDATE receipts SET currency = 'SGD', total = ? WHERE id = ?", (amount_sgd, receipt_id))
+
+    for part in parts:
+        label = part.get("name") or (index[part["category_id"]]["name"] if part.get("category_id") in index else "Other")
+        conn.execute(
+            "INSERT INTO line_items (receipt_id, name, price, quantity, is_deposit, split_mode, category_id) VALUES (?, ?, ?, 1, 0, 'mine', ?)",
+            (receipt_id, label, part["amount_sgd"], part.get("category_id")),
+        )
+    remainder = round((amount_sgd or 0) - assigned, 2)
+    if remainder > BALANCE_TOLERANCE:
+        conn.execute(
+            "INSERT INTO line_items (receipt_id, name, price, quantity, is_deposit, split_mode) VALUES (?, 'Unsorted remainder', ?, 1, 0, 'mine')",
+            (receipt_id, remainder),
+        )
+    conn.commit()
+
+
+
+def classify(
+    conn: sqlite3.Connection, transaction_id: int, transaction_type: TransactionType,
+    refunds_receipt_id: Optional[int] = None, reimbursement_amount: Optional[float] = None,
+) -> None:
+    """Reclassifies a transaction. Turning an expense into anything else also drops the hand-made
+    receipt that was standing in for it (its items would otherwise stay in spending as orphans);
+    a receipt read off a photo is kept and simply becomes unmatched."""
+    row = conn.execute(
+        """
+        SELECT t.amount_sgd, t.matched_receipt_id, r.raw_text, r.source_image_path
+        FROM youtrip_transactions t LEFT JOIN receipts r ON r.id = t.matched_receipt_id WHERE t.id = ?
+        """,
+        (transaction_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("No such transaction.")
+    amount, receipt_id, raw_text, source_image = row
+    if reimbursement_amount is not None and not (0 <= reimbursement_amount <= abs(amount or 0) + BALANCE_TOLERANCE):
+        raise ValueError("The reimbursed part can't be more than the payment itself.")
+    if transaction_type != TransactionType.EXPENSE and receipt_id is not None and not (raw_text or source_image):
+        classify_transaction(conn, transaction_id, transaction_type, refunds_receipt_id, reimbursement_amount)
+        _delete_receipt(conn, receipt_id)
+        conn.commit()
+        return
+    classify_transaction(conn, transaction_id, transaction_type, refunds_receipt_id, reimbursement_amount)
+
+
+def accept_suggestions(conn: sqlite3.Connection, item_ids: List[int]) -> List[Tuple[str, List[str]]]:
+    """Turns each item's current *suggested* category into a confirmed one - an explicit user action
+    ('yes, that guess is right'), never something that happens on its own. Items with no suggestion are skipped."""
+    wanted = {i["id"]: i["category_id"] for i in _all_items(conn) if i["category_confidence"] == "suggested"}
+    touched: List[Tuple[str, List[str]]] = []
+    for item_id in item_ids:
+        category_id = wanted.get(item_id)
+        if category_id is not None:
+            touched.extend(assign_category(conn, [item_id], category_id))
+    return touched

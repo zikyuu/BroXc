@@ -2,31 +2,36 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#fbf6ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161412" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Expenses">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="apple-touch-icon" href="icon.png">
+  <link rel="icon" href="icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
   <title>Expense Tracker</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>Expense Tracker</h1>
-    <nav class="tabs" role="tablist" aria-label="Sections">
-      <button role="tab" data-tab="spending" aria-selected="true">Spending</button>
-      <button role="tab" data-tab="reconcile" aria-selected="false">Reconcile</button>
-      <button role="tab" data-tab="add" aria-selected="false">Add</button>
-    </nav>
-  </header>
-
-  <button id="status" class="status" type="button" hidden></button>
-
-  <main>
-    <section id="tab-spending" class="tab" role="tabpanel"></section>
-    <section id="tab-reconcile" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-add" class="tab" role="tabpanel" hidden></section>
-  </main>
-
-  <div id="bulkbar" class="bulkbar" hidden></div>
+  <div id="app">
+    <main id="view" aria-live="polite"></main>
+    <div id="editbar" class="editbar" hidden></div>
+    <nav class="bottom-nav" aria-label="Main"></nav>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-  <script src="app.js"></script>
+  <script src="js/core.js"></script>
+  <script src="js/charts.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/home.js"></script>
+  <script src="js/category.js"></script>
+  <script src="js/activity.js"></script>
+  <script src="js/trips.js"></script>
+  <script src="js/reimburse.js"></script>
+  <script src="js/more.js"></script>
+  <script src="js/main.js"></script>
 </body>
 </html>

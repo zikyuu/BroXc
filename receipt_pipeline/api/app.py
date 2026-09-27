@@ -17,10 +17,11 @@ from pydantic import BaseModel
 
 from ..matcher import run_matching
 from ..receipts.tag_store import TagStore
-from ..shared.db import ledger
+from ..shared.db import categories as category_store
+from ..shared.db import insights, ledger
 from ..shared.db.database import (
-    DEFAULT_DB_PATH, classify_transaction, connect, create_trip, get_active_trip, save_receipt,
-    set_active_trip, set_receipt_trip, set_transaction_trip,
+    DEFAULT_DB_PATH, connect, create_trip, get_active_trip, save_receipt,
+    set_active_trip, set_receipt_trip, set_transaction_trip, update_trip,
 )
 from ..types import SplitMode, TransactionType
 
@@ -166,6 +167,8 @@ class TripCreate(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     activate: bool = False
+    color: Optional[str] = None
+    emoji: Optional[str] = None
 
 
 @app.post("/api/trips")
@@ -173,7 +176,7 @@ def new_trip(trip: TripCreate):
     if not trip.name.strip():
         raise HTTPException(400, "A trip needs a name.")
     with db() as conn:
-        return {"id": create_trip(conn, trip.name.strip(), trip.start_date, trip.end_date, trip.activate)}
+        return {"id": create_trip(conn, trip.name.strip(), trip.start_date, trip.end_date, trip.activate, trip.color, trip.emoji)}
 
 
 @app.post("/api/trips/{trip_id}/activate")
@@ -212,6 +215,7 @@ def assign_transaction_trip(transaction_id: int, request: TripAssign):
 class Classification(BaseModel):
     type: TransactionType
     refunds_receipt_id: Optional[int] = None
+    reimbursement_amount: Optional[float] = None  # the part of a reimbursement that reduces what's owed; the rest is income
 
 
 @app.post("/api/transactions/{transaction_id}/classify")
@@ -219,7 +223,10 @@ def classify(transaction_id: int, request: Classification):
     """Reclassify a transaction, e.g. an incoming credit as a reimbursement. Non-expenses leave
     the receipt matcher and personal spend."""
     with db() as conn:
-        classify_transaction(conn, transaction_id, request.type, request.refunds_receipt_id)
+        try:
+            ledger.classify(conn, transaction_id, request.type, request.refunds_receipt_id, request.reimbursement_amount)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
     return {"ok": True}
 
 
@@ -246,6 +253,245 @@ def link(transaction_id: int, request: LinkRequest):
     with db() as conn:
         ledger.link_match(conn, transaction_id, request.receipt_id)
     return {"ok": True}
+
+
+# ---- the phone UI's screens ----
+
+@app.get("/api/home")
+def home(month: Optional[str] = None):
+    with db() as conn:
+        return insights.home(conn, month)
+
+
+@app.get("/api/activity")
+def activity():
+    with db() as conn:
+        return {"entries": insights.activity_feed(conn), "unmatched_receipts": ledger.list_unmatched_receipts(conn),
+                "status": ledger.status(conn)}
+
+
+@app.get("/api/review")
+def review(month: Optional[str] = None):
+    with db() as conn:
+        return insights.review_list(conn, month)
+
+
+class AcceptRequest(BaseModel):
+    item_ids: List[int]
+
+
+@app.post("/api/review/accept")
+def accept_suggestions(request: AcceptRequest):
+    """Confirms the app's own category guesses for these items - only ever on the user's say-so."""
+    with db() as conn:
+        touched = ledger.accept_suggestions(conn, request.item_ids)
+    return {"updated": len(touched)}
+
+
+@app.get("/api/search")
+def search(q: str = ""):
+    with db() as conn:
+        return insights.search(conn, q)
+
+
+@app.get("/api/trends")
+def trends(range: str = "1M"):
+    with db() as conn:
+        return insights.trends(conn, range)
+
+
+@app.get("/api/travel")
+def travel():
+    with db() as conn:
+        return insights.travel_summary(conn)
+
+
+@app.get("/api/trips/{trip_id}")
+def trip_detail(trip_id: int):
+    with db() as conn:
+        detail = insights.trip_detail(conn, trip_id)
+    if not detail:
+        raise HTTPException(404, "No such trip.")
+    return detail
+
+
+class TripEdit(BaseModel):
+    name: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    color: Optional[str] = None
+    emoji: Optional[str] = None
+
+
+@app.patch("/api/trips/{trip_id}")
+def edit_trip(trip_id: int, edit: TripEdit):
+    with db() as conn:
+        update_trip(conn, trip_id, **edit.model_dump(exclude_unset=True))
+    return {"ok": True}
+
+
+# categories
+
+@app.get("/api/categories")
+def categories():
+    with db() as conn:
+        return category_store.list_categories(conn)
+
+
+@app.get("/api/category-tree")
+def category_tree(start: Optional[str] = None, end: Optional[str] = None, trip_id: Optional[int] = None):
+    with db() as conn:
+        return insights.category_tree(conn, start, end, trip_id)
+
+
+class CategoryCreate(BaseModel):
+    name: str
+    parent_id: Optional[int] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+
+
+@app.post("/api/categories")
+def new_category(category: CategoryCreate):
+    with db() as conn:
+        try:
+            return {"id": category_store.create_category(conn, category.name, category.parent_id, category.icon, category.color)}
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+
+
+class CategoryEdit(BaseModel):
+    name: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    budget_sgd: Optional[float] = None
+    parent_id: Optional[int] = None
+
+
+@app.patch("/api/categories/{category_id}")
+def edit_category(category_id: int, edit: CategoryEdit):
+    with db() as conn:
+        try:
+            category_store.update_category(conn, category_id, **edit.model_dump(exclude_unset=True))
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    return {"ok": True}
+
+
+@app.delete("/api/categories/{category_id}")
+def remove_category(category_id: int):
+    with db() as conn:
+        try:
+            moved = category_store.delete_category(conn, category_id)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    return {"moved_items": moved}
+
+
+class CategoryAssign(BaseModel):
+    item_ids: List[int]
+    category_id: Optional[int] = None  # null clears it back to whatever the tags suggest
+    learn: bool = False  # also start future receipts' matching items in this category
+    also_similar: bool = False  # also move unconfirmed items with the same name
+
+
+@app.post("/api/items/category")
+def assign_category(change: CategoryAssign):
+    with db() as conn:
+        try:
+            touched = ledger.assign_category(conn, change.item_ids, change.category_id, change.also_similar)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    if change.learn and change.category_id is not None:
+        store = _tag_store()
+        for name, path in touched:
+            store.record_correction(name, [p.lower() for p in path])  # e.g. ["food", "cooking ingredients", "meat", "chicken"]
+    return {"updated": len(touched)}
+
+
+# transaction detail and edits
+
+@app.get("/api/transactions/{transaction_id}")
+def transaction_detail(transaction_id: int):
+    with db() as conn:
+        detail = ledger.transaction_detail(conn, transaction_id)
+    if not detail:
+        raise HTTPException(404, "No such transaction.")
+    return detail
+
+
+class SplitRequest(BaseModel):
+    my_share_sgd: float
+
+
+@app.post("/api/transactions/{transaction_id}/split")
+def split_transaction(transaction_id: int, request: SplitRequest):
+    with db() as conn:
+        try:
+            ledger.set_transaction_split(conn, transaction_id, request.my_share_sgd)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    return {"ok": True}
+
+
+class NoteRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@app.post("/api/transactions/{transaction_id}/note")
+def transaction_note(transaction_id: int, request: NoteRequest):
+    with db() as conn:
+        ledger.set_transaction_note(conn, transaction_id, request.note)
+    return {"ok": True}
+
+
+@app.delete("/api/transactions/{transaction_id}")
+def remove_transaction(transaction_id: int):
+    with db() as conn:
+        try:
+            ledger.delete_transaction(conn, transaction_id)
+        except ValueError as error:
+            raise HTTPException(404, str(error))
+    return {"ok": True}
+
+
+class BreakdownPart(BaseModel):
+    category_id: Optional[int] = None
+    amount_sgd: float
+    name: Optional[str] = None
+
+
+class BreakdownRequest(BaseModel):
+    parts: List[BreakdownPart]
+
+
+@app.post("/api/transactions/{transaction_id}/breakdown")
+def breakdown(transaction_id: int, request: BreakdownRequest):
+    with db() as conn:
+        try:
+            ledger.breakdown_transaction(conn, transaction_id, [p.model_dump() for p in request.parts])
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+    return {"ok": True}
+
+
+# balance reconciliation
+
+@app.get("/api/balance")
+def balance():
+    with db() as conn:
+        return {"current": insights.current_balance(conn), "history": insights.list_reconciliations(conn)}
+
+
+class BalanceRequest(BaseModel):
+    actual_sgd: float
+    date: Optional[str] = None
+
+
+@app.post("/api/balance")
+def reconcile(request: BalanceRequest):
+    with db() as conn:
+        return insights.reconcile_balance(conn, request.actual_sgd, request.date)
 
 
 # ---- uploading (runs OCR, which takes a while, so these are plain `def` - FastAPI runs them in a worker thread) ----

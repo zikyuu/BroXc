@@ -94,10 +94,36 @@ CREATE TABLE IF NOT EXISTS trips (
     is_active INTEGER NOT NULL DEFAULT 0
 );
 
+-- the user's own category tree (Food -> Cooking Ingredients -> Meat -> Chicken). Every item sits at
+-- one node; flat tags stay as optional extra labels. kind: normal | misc (a deliberate "doesn't
+-- fit elsewhere" bucket) | grocery (the unitemised bucket for receipt-less supermarket charges)
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES categories(id),
+    color TEXT,
+    icon TEXT,
+    budget_sgd REAL,
+    kind TEXT NOT NULL DEFAULT 'normal',
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+
+-- each time the user types in their real card balance. implied_sgd is what tracked transactions
+-- said it should be; the gap is "untracked" (money with no record at all). last_txn_id snapshots
+-- which transactions were already known, so late-entered old ones aren't double counted
+CREATE TABLE IF NOT EXISTS balance_reconciliations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciled_on TEXT NOT NULL,
+    actual_sgd REAL NOT NULL,
+    implied_sgd REAL,
+    untracked_sgd REAL NOT NULL DEFAULT 0,
+    last_txn_id INTEGER NOT NULL DEFAULT 0
+);
+
 -- a checkpoint each time the paid-for-others balance settles back to exactly $0 - lets "recent
 -- activity" show what's happened since the last time everything was square, per the spec's
--- zero-balance checkpoint idea, without needing to allocate debt to specific people
--- a checkpoint snapshots exactly which paid-for-others items and reimbursements it settled (JSON
+-- zero-balance checkpoint idea, without needing to allocate debt to specific people.
+-- It snapshots exactly which paid-for-others items and reimbursements it settled (JSON
 -- id lists), so "activity since" is whatever isn't in the snapshot. Dates can't anchor this:
 -- spending gets entered late, so a back-dated item must still show up as new. reached_at is just
 -- the date of the latest covered activity, for display.
@@ -115,6 +141,8 @@ CREATE TABLE IF NOT EXISTS balance_checkpoints (
 # table that already exists, so a database created earlier gets these added by _migrate instead.
 MIGRATIONS = {
     "receipts": {"merchant_original": "TEXT", "trip_id": "INTEGER REFERENCES trips(id)"},
+    "line_items": {"category_id": "INTEGER REFERENCES categories(id)"},
+    "trips": {"color": "TEXT", "emoji": "TEXT"},
     "youtrip_transactions": {
         "local_amount": "REAL",
         "local_currency": "TEXT",
@@ -123,6 +151,10 @@ MIGRATIONS = {
         "transaction_type": "TEXT NOT NULL DEFAULT 'expense'",
         "trip_id": "INTEGER REFERENCES trips(id)",
         "refunds_receipt_id": "INTEGER REFERENCES receipts(id)",
+        "user_note": "TEXT",
+        # how much of an incoming reimbursement actually reduces what's owed (NULL = all of it);
+        # the excess over the outstanding balance is treated as income instead of a negative receivable
+        "reimbursement_amount": "REAL",
     },
     "balance_checkpoints": {
         "paid_total": "REAL", "received_total": "REAL", "item_ids": "TEXT", "reimbursement_ids": "TEXT",
@@ -139,12 +171,67 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# (name, icon, kind, children). Top-level colours come from TOP_LEVEL_COLORS by position. This is
+# only a starting point - the whole tree is editable in the app.
+DEFAULT_CATEGORIES = [
+    ("Food", "🍴", "normal", [
+        ("Cooking Ingredients", "🧺", "normal", [
+            ("Meat", "🥩", "normal", [
+                ("Chicken", "🍗", "normal", []), ("Pork", "🥓", "normal", []), ("Beef", "🥩", "normal", []),
+                ("Fish", "🐟", "normal", []), ("Misc", "•", "misc", []),
+            ]),
+            ("Vegetables", "🥬", "normal", []), ("Carbs", "🍞", "normal", []), ("Condiments", "🧂", "normal", []),
+            ("Grocery Shopping", "🛒", "grocery", []),
+        ]),
+        ("Eat Out", "🍜", "normal", []), ("Snacks", "🍿", "normal", []), ("Drinks", "🥤", "normal", []),
+        ("Misc", "•", "misc", []),
+    ]),
+    ("Transport", "🚆", "normal", [
+        ("Public Transit", "🚌", "normal", []), ("Taxi", "🚕", "normal", []),
+        ("Long Distance", "✈️", "normal", []), ("Misc", "•", "misc", []),
+    ]),
+    ("Accommodation", "🛏️", "normal", []),
+    ("Activities", "🎟️", "normal", []),
+    ("Shopping", "🛍️", "normal", [
+        ("Clothes", "👕", "normal", []), ("Electronics", "🔌", "normal", []), ("Misc", "•", "misc", []),
+    ]),
+    ("Souvenirs", "🎁", "normal", []),
+    ("Household", "🏠", "normal", []),
+    ("Health", "💊", "normal", []),
+    ("Misc", "•", "misc", []),
+]
+TOP_LEVEL_COLORS = [
+    "#ff8a75", "#5d8df6", "#7c83f5", "#ffb066", "#b36cf0",
+    "#f58bd0", "#a5d86e", "#4fd1a5", "#c9a877",
+]
+
+
+def seed_default_categories(conn: sqlite3.Connection) -> None:
+    """Fills an empty category table with the starter tree. Never touches an existing one."""
+    if conn.execute("SELECT 1 FROM categories LIMIT 1").fetchone():
+        return
+
+    def insert(node, parent_id, color, order):
+        name, icon, kind, children = node
+        cursor = conn.execute(
+            "INSERT INTO categories (name, parent_id, color, icon, kind, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, parent_id, color, icon, kind, order),
+        )
+        for child_order, child in enumerate(children):
+            insert(child, cursor.lastrowid, None, child_order)
+
+    for order, node in enumerate(DEFAULT_CATEGORIES):
+        insert(node, None, TOP_LEVEL_COLORS[order % len(TOP_LEVEL_COLORS)], order)
+    conn.commit()
+
+
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Opens (creating if needed) the local SQLite database with the schema applied."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     _migrate(conn)
+    seed_default_categories(conn)
     return conn
 
 
@@ -230,10 +317,11 @@ def save_youtrip_transaction(conn: sqlite3.Connection, transaction: YouTripTrans
 def create_trip(
     conn: sqlite3.Connection, name: str, start_date: Optional[str] = None,
     end_date: Optional[str] = None, activate: bool = False,
+    color: Optional[str] = None, emoji: Optional[str] = None,
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO trips (name, start_date, end_date, is_active) VALUES (?, ?, ?, 0)",
-        (name, start_date, end_date),
+        "INSERT INTO trips (name, start_date, end_date, is_active, color, emoji) VALUES (?, ?, ?, 0, ?, ?)",
+        (name, start_date, end_date, color, emoji),
     )
     conn.commit()
     if activate:
@@ -241,21 +329,32 @@ def create_trip(
     return cursor.lastrowid
 
 
+TRIP_COLUMNS = "id, name, start_date, end_date, is_active, color, emoji"
+
+
 def _trip_from_row(row) -> Trip:
-    return Trip(id=row[0], name=row[1], start_date=row[2], end_date=row[3], is_active=bool(row[4]))
+    return Trip(id=row[0], name=row[1], start_date=row[2], end_date=row[3], is_active=bool(row[4]),
+                color=row[5], emoji=row[6])
+
+
+def update_trip(conn: sqlite3.Connection, trip_id: int, **fields) -> None:
+    """Edits a trip's name, dates, colour or emoji - only the fields actually passed."""
+    allowed = {"name", "start_date", "end_date", "color", "emoji"}
+    changes = {k: v for k, v in fields.items() if k in allowed}
+    if not changes:
+        return
+    assignments = ", ".join(f"{column} = ?" for column in changes)
+    conn.execute(f"UPDATE trips SET {assignments} WHERE id = ?", (*changes.values(), trip_id))
+    conn.commit()
 
 
 def list_trips(conn: sqlite3.Connection) -> List[Trip]:
-    rows = conn.execute(
-        "SELECT id, name, start_date, end_date, is_active FROM trips ORDER BY start_date DESC, id DESC"
-    ).fetchall()
+    rows = conn.execute(f"SELECT {TRIP_COLUMNS} FROM trips ORDER BY start_date DESC, id DESC").fetchall()
     return [_trip_from_row(row) for row in rows]
 
 
 def get_active_trip(conn: sqlite3.Connection) -> Optional[Trip]:
-    row = conn.execute(
-        "SELECT id, name, start_date, end_date, is_active FROM trips WHERE is_active = 1"
-    ).fetchone()
+    row = conn.execute(f"SELECT {TRIP_COLUMNS} FROM trips WHERE is_active = 1").fetchone()
     return _trip_from_row(row) if row else None
 
 
@@ -280,33 +379,40 @@ def set_receipt_trip(conn: sqlite3.Connection, receipt_id: int, trip_id: Optiona
 
 
 def set_transaction_trip(conn: sqlite3.Connection, transaction_id: int, trip_id: Optional[int]) -> None:
+    """Moves a transaction into (or out of) a trip. Its matched receipt moves with it, since an item's
+    trip is read from its receipt - otherwise the transaction and its own items would disagree."""
     conn.execute("UPDATE youtrip_transactions SET trip_id = ? WHERE id = ?", (trip_id, transaction_id))
+    conn.execute(
+        "UPDATE receipts SET trip_id = ? WHERE id = (SELECT matched_receipt_id FROM youtrip_transactions WHERE id = ?)",
+        (trip_id, transaction_id),
+    )
     conn.commit()
 
 
 def classify_transaction(
     conn: sqlite3.Connection, transaction_id: int, transaction_type: TransactionType,
-    refunds_receipt_id: Optional[int] = None,
+    refunds_receipt_id: Optional[int] = None, reimbursement_amount: Optional[float] = None,
 ) -> None:
     """Reclassifies a transaction (e.g. an incoming YouTrip credit as a reimbursement). Anything
     that isn't an expense is pulled out of the receipt matcher, so a match it already holds is
     cleared, and it leaves any trip it was auto-tagged into."""
     if transaction_type == TransactionType.EXPENSE:
         conn.execute(
-            "UPDATE youtrip_transactions SET transaction_type = ?, refunds_receipt_id = NULL WHERE id = ?",
+            "UPDATE youtrip_transactions SET transaction_type = ?, refunds_receipt_id = NULL, reimbursement_amount = NULL WHERE id = ?",
             (transaction_type.value, transaction_id),
         )
     else:
         conn.execute(
             """
             UPDATE youtrip_transactions
-            SET transaction_type = ?, refunds_receipt_id = ?, matched_receipt_id = NULL,
+            SET transaction_type = ?, refunds_receipt_id = ?, reimbursement_amount = ?, matched_receipt_id = NULL,
                 match_status = NULL, match_note = NULL, trip_id = NULL
             WHERE id = ?
             """,
             (
                 transaction_type.value,
                 refunds_receipt_id if transaction_type == TransactionType.REFUND else None,
+                reimbursement_amount if transaction_type == TransactionType.REIMBURSEMENT else None,
                 transaction_id,
             ),
         )
@@ -442,3 +548,13 @@ def get_reference_rates(conn: sqlite3.Connection, min_samples: int = 3) -> Dict[
         rates_by_currency[currency.upper()].append(rate)
 
     return {c: median(rates) for c, rates in rates_by_currency.items() if len(rates) >= min_samples}
+
+
+def list_balance_checkpoints(conn: sqlite3.Connection) -> List[dict]:
+    """Every settled checkpoint, newest first - the 'History' of paid-for-others."""
+    return [
+        {"reached_at": r[0], "paid_total": r[1], "received_total": r[2]}
+        for r in conn.execute(
+            "SELECT reached_at, paid_total, received_total FROM balance_checkpoints ORDER BY id DESC"
+        )
+    ]

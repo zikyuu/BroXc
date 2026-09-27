@@ -105,3 +105,5 @@ class Trip:
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     is_active: bool = False  # whether Trip Mode is currently on for this trip — new transactions auto-tag while true
+    color: Optional[str] = None  # accent for the trip's banner, since there are no photos
+    emoji: Optional[str] = None

@@ -19,7 +19,9 @@ from receipt_pipeline.shared.db.database import (
     classify_transaction, connect, create_trip, record_match, save_receipt, save_youtrip_transaction,
     set_receipt_trip, set_transaction_trip,
 )
-from receipt_pipeline.shared.db.ledger import set_split
+from receipt_pipeline.shared.db import categories as category_store
+from receipt_pipeline.shared.db.insights import reconcile_balance
+from receipt_pipeline.shared.db.ledger import assign_category, set_split
 from receipt_pipeline.types import Lineitem, ReceiptDraft, SplitMode, TransactionType, YouTripTransaction
 
 DB, TAGS = Path("demo.db"), Path("demo_tag_store.json")
@@ -34,7 +36,7 @@ def receipt(merchant, original, days_ago, currency, items):
     return save_receipt(conn, ReceiptDraft(
         merchant=merchant, merchant_original=original,
         date=(today - timedelta(days=days_ago)).isoformat(), currency=currency,
-        total=round(sum(i.price for i in items), 2), line_items=items,
+        total=round(sum(i.price for i in items), 2), line_items=items, raw_text="(demo receipt)",
     ))
 
 
@@ -102,6 +104,53 @@ lunch_item = conn.execute("SELECT id FROM line_items WHERE receipt_id = ?", (r_c
 set_split(conn, [lunch_item], SplitMode.SHARED, [{"person": "me", "percentage": 50}, {"person": "Sam", "percentage": 50}])
 paid_back = charge(10, "FROM SAM", 30.00, None, None)
 classify_transaction(conn, paid_back, TransactionType.REIMBURSEMENT)
+
+# ---- three earlier months at home (SGD), so "usual", trends and projections have history ----
+def first_of_month(offset):
+    index = today.year * 12 + today.month - 1 - offset
+    return date(index // 12, index % 12 + 1, 1)
+
+
+HISTORY = [  # (day of month, merchant, [(item, price, tags)])
+    (3, "Cold Storage", [("Chicken thigh", 9.80, ["food", "meat"]), ("Broccoli", 3.20, ["food", "vege"]), ("Rice 5kg", 12.90, ["food"])]),
+    (8, "MRT top-up", [("Card top-up", 30.00, ["transport"])]),
+    (12, "Ramen Bar", [("Ramen set", 16.50, ["food", "meals out"])]),
+    (17, "Cold Storage", [("Salmon fillet", 11.40, ["food", "meat"]), ("Onions", 2.10, ["food", "vege"]), ("Milk", 3.50, ["food"])]),
+    (21, "Uniqlo", [("T-shirt", 19.90, ["shopping"])]),
+    (25, "Guardian", [("Vitamins", 14.00, ["health"])]),
+]
+for months_ago, factor in [(3, 3.6), (2, 4.0), (1, 4.4)]:  # scaled up: an exchange student's month is bigger than one grocery run
+    month_start = first_of_month(months_ago)
+    for day, merchant, rows in HISTORY:
+        conn_items = [Lineitem(name=n, price=round(price * factor, 2), tags=t) for n, price, t in rows]
+        save_receipt(conn, ReceiptDraft(
+            merchant=merchant, date=month_start.replace(day=day).isoformat(), currency="SGD",
+            total=round(sum(i.price for i in conn_items), 2), line_items=conn_items, raw_text="(demo receipt)",
+        ))
+
+# ---- the user has confirmed some categories; the rest stay suggestions or unknown, so Needs a Look has content ----
+index = category_store.category_index(conn)
+by_name = {c["name"]: c["id"] for c in index.values() if c["kind"] != "misc"}
+confirmed = {"Coffee": "Drinks", "Sandwich": "Eat Out", "Lunch for two": "Eat Out", "Bread and pastries": "Carbs",
+             "Travel card top-up": "Public Transit", "Postcards": "Souvenirs", "Facial napkins": "Household"}
+for name, category in confirmed.items():
+    ids = [r[0] for r in conn.execute("SELECT id FROM line_items WHERE name = ?", (name,))]
+    assign_category(conn, ids, by_name[category])
+
+# ---- Trip Mode is on for a Tallinn trip: the latest charges joined it automatically ----
+tallinn = create_trip(conn, "Tallinn trip", (today - timedelta(days=1)).isoformat(), (today + timedelta(days=4)).isoformat(),
+                      activate=True, color="#5d8df6", emoji="🏰")
+set_receipt_trip(conn, r_coop, tallinn)
+set_transaction_trip(conn, t_coop, tallinn)
+for description, sgd, local, days_ago in [("RAKVERE KOHVIK TALLINN", 7.20, 5.00, 1), ("BOLT TALLINN", 11.80, 8.20, 0)]:
+    charge(days_ago, description, sgd, local, "EUR")  # saved while Trip Mode is on, so they tag themselves
+
+# ---- balance: a baseline, then activity, then a check that finds $48 the records can't explain ----
+reconcile_balance(conn, 1500.00, first_of_month(0).isoformat())
+for days_ago, description, sgd in [(3, "DABBA COFFEE", 6.50), (1, "COMFORT TAXI", 12.00)]:
+    save_youtrip_transaction(conn, YouTripTransaction(
+        date=(today - timedelta(days=days_ago)).strftime("%d %b %Y"), description=description, amount_sgd=sgd))
+reconcile_balance(conn, round(1500.00 - 6.50 - 12.00 - 48.00, 2), today.isoformat())
 
 # ---- corrections the tag store has learned, so tag suggestions have something to draw on ----
 store = TagStore(TAGS)
