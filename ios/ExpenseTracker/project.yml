@@ -1,4 +1,5 @@
 name: ExpenseTracker
+options:
   bundleIdPrefix: com.shianne.expensetracker
   deploymentTarget:
     iOS: "17.0"

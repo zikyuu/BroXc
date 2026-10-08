@@ -5,6 +5,7 @@ import SwiftData
 /// `seed_default_categories`/`DEFAULT_CATEGORIES` in the Python backend — same names, same shape.
 /// Never touches an existing tree (the user's edits are never overwritten).
 enum CategorySeeder {
+    /// A nominal type, not a tuple: a tuple typealias can't reference itself (`(..., [Node])` inside
     /// its own definition), since a typealias is a structural substitution, not a real recursive type.
     private struct Node {
         let name: String
