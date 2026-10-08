@@ -10,3 +10,10 @@ receipt.jpg
 receipt_thresh.png
 youtrip_screenshot.png
 translated_receipt.png
+
+# Xcode: per-user state and build output never belong in version control
+xcuserdata/
+*.xcuserstate
+DerivedData/
+# ...but the asset catalog's Contents.json files do (the *.json rule above would swallow them)
+!ios/**/Contents.json
