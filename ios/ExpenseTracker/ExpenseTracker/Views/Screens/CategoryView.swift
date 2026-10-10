@@ -58,11 +58,28 @@ struct CategoryView: View {
     private func content(_ ledger: Ledger) -> some View {
         let tree = tree(ledger)
         if let node = node(tree) {
-            let items = scopeItems(ledger).filter { !$0.isDeposit && ($0.personalSGD ?? 1) > 0 && belongs($0) }
+            let items = scopeItems(ledger).filter { ($0.isDeposit || ($0.personalSGD ?? 1) > 0) && belongs($0) }
                 .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
             let share = tree.totalSGD > 0 ? node.totalSGD / tree.totalSGD * 100 : 0
             Screen {
                 hero(node, share: share)
+                if node.kind == .deposit {
+                    // every deposit in this period, including the ones that sit with their drink in another category
+                    let deposits = scopeItems(ledger).filter(\.isDeposit)
+                    let pant = Ledger.pantSummary(deposits)
+                    let kr = deposits.filter { ($0.currency ?? "").uppercased() == "SEK" }.map(\.price)
+                    VStack(spacing: 8) {
+                        HStack {
+                            pantFigure("Paid", pant.paid, Theme.text)
+                            pantFigure("Returned", pant.returned, Theme.good)
+                            pantFigure("Net cost", pant.net, Theme.accent)
+                        }
+                        if !kr.isEmpty {
+                            Text(String(format: "%.0f kr paid · %.0f kr returned", kr.filter { $0 > 0 }.reduce(0, +), -kr.filter { $0 < 0 }.reduce(0, +)))
+                                .font(.rounded(12)).foregroundStyle(Theme.muted)
+                        }
+                    }.card()
+                }
                 if !node.isUnsorted {
                     SegmentedTabs(options: [(Tab.breakdown, "Breakdown"), (Tab.transactions, "Transactions")], selection: $tab)
                 }
@@ -171,6 +188,13 @@ struct CategoryView: View {
         }
     }
 
+    private func pantFigure(_ title: String, _ amount: Double, _ color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(Money.string(amount)).font(.rounded(18, .heavy)).foregroundStyle(color)
+            Text(title).font(.rounded(12)).foregroundStyle(Theme.muted)
+        }.frame(maxWidth: .infinity)
+    }
+
     private func selectionBar(_ items: [ItemView], _ ledger: Ledger) -> some View {
         HStack {
             Text("\(selected.count) selected").font(.rounded(15, .bold))
@@ -265,7 +289,7 @@ private struct Tile: View {
     private var color: Color {
         if node.isUnsorted || node.kind == .misc { return Theme.miscColor }
         if node.kind == .grocery { return Color(hex: "8ab8ff") }
-        if node.category?.parent == nil { return Color(hex: node.colorHex) }
+        if node.category?.parent == nil || node.category?.colorHex != nil { return Color(hex: node.colorHex) }
         return Theme.stablePastel(node.name)
     }
 

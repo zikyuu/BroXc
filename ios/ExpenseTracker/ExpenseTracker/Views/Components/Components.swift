@@ -210,10 +210,13 @@ struct TransactionRow: View {
     private var subtitle: String {
         var parts: [String] = []
         if showDate, let date = entry.date { parts.append(date.formatted(.dateTime.day().month(.abbreviated))) }
-        if entry.isIncoming { parts.append(Self.incomingLabel[entry.type] ?? "Money in") }
+        if entry.isIncoming { parts.append(entry.transaction?.incomeLabel ?? Self.incomingLabel[entry.type] ?? "Money in") }
         else if entry.status == "receipt_only" { parts.append("Receipt · no charge linked yet") }
         else if let c = entry.category, c.mixed { parts.append("\(c.distinct) categories") }
-        else if let c = entry.category?.category { parts.append(c.path.suffix(2).joined(separator: " › ")) }
+        else if let c = entry.category?.category {
+            let path = c.path.suffix(2).joined(separator: " › ")
+            parts.append(entry.category?.confidence == .suggested ? "Guess: \(path)" : path)
+        }
         else { parts.append("Unsorted") }
         return parts.joined(separator: " · ")
     }
@@ -225,15 +228,17 @@ struct TransactionRow: View {
             else {
                 let cat = entry.category?.category
                 IconTile(symbol: cat?.icon ?? (entry.kind == .receipt ? "🧾" : "•"), color: cat.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor)
+                    .opacity(entry.category?.confidence == .suggested ? 0.45 : 1)
             }
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.title).font(.rounded(15, .semibold)).lineLimit(1)
                 Text(subtitle).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
-                if entry.trip != nil || entry.status == "needs_review" || entry.status == "unmatched" {
+                if entry.trip != nil || entry.status == "needs_review" || entry.status == "unmatched" || entry.category?.confidence == .suggested {
                     HStack(spacing: 5) {
                         if let trip = entry.trip { MiniChip(text: trip.name, style: .trip) }
                         if entry.status == "needs_review" { MiniChip(text: "check match", style: .warn) }
                         if entry.status == "unmatched" { MiniChip(text: "no receipt", style: .quiet) }
+                        if !entry.isIncoming, entry.category?.confidence == .suggested { MiniChip(text: "guessed", style: .quiet) }
                     }.lineLimit(1)
                 }
             }

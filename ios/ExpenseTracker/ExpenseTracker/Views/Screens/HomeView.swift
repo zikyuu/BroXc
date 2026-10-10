@@ -69,19 +69,6 @@ struct HomeView: View {
                 needsLookCard(data)
                 comparedCard(data)
             }
-            SectionTitle("Recent transactions") {
-                Button("See all") { navigation.selectedTab = .activity }.font(.rounded(13, .semibold)).foregroundStyle(Theme.accent)
-            }
-            if data.recent.isEmpty { Text("Nothing yet.").font(.rounded(13)).foregroundStyle(Theme.muted) }
-            else {
-                Rows {
-                    ForEach(data.recent) { entry in
-                        NavigationLink(value: entry.transaction != nil ? Route.transaction(entry.transaction!) : Route.receipt(entry.receipt!)) {
-                            TransactionRow(entry: entry, showDate: true)
-                        }.buttonStyle(.plain)
-                    }
-                }.flushCard()
-            }
         }
     }
 

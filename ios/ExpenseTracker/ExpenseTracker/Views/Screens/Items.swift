@@ -12,6 +12,8 @@ enum ItemFormat {
 
 struct ItemRow: View {
     let item: ItemView
+    /// Bottle deposits paid with this item, shown as small lines under it.
+    var children: [ItemView] = []
     var selecting = false
     var selected = false
 
@@ -31,6 +33,9 @@ struct ItemRow: View {
                     Text(item.isVirtual ? "no receipt" : (item.merchant ?? "Unknown store")).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
                     if item.splitMode != .mine { MiniChip(text: (item.othersSGD ?? 0) > 0 ? "paid \(Money.whole(item.othersSGD ?? 0)) for others" : "paid for others", style: .paid) }
                     if let trip = item.trip { MiniChip(text: trip.name, style: .trip) }
+                }
+                ForEach(children) { child in
+                    Text("♻️ \(child.name) · \(ItemFormat.amount(child).text)").font(.rounded(12)).foregroundStyle(Theme.muted)
                 }
             }
             Spacer(minLength: 6)
@@ -59,9 +64,9 @@ struct ItemList: View {
 
     var body: some View {
         LazyVStack(spacing: 8) {
-            ForEach(items) { item in
+            ForEach(topLevel) { item in
                 let isSelected = selected.contains(item.id)
-                ItemRow(item: item, selecting: selecting, selected: isSelected)
+                ItemRow(item: item, children: items.filter { $0.parentID == item.id }, selecting: selecting, selected: isSelected)
                     .onTapGesture {
                         if selecting { if isSelected { selected.remove(item.id) } else { selected.insert(item.id) } }
                         else { onOpen(item) }
@@ -71,9 +76,67 @@ struct ItemList: View {
         }
     }
 
+    /// A deposit paid with a drink is shown inside that drink's row, not as a row of its own.
+    private var topLevel: [ItemView] {
+        let ids = Set(items.map(\.id))
+        return items.filter { $0.parentID == nil || !ids.contains($0.parentID!) }
+    }
+
     /// Drag payload: the ids being moved, newline-separated plain text.
     private func payload(for item: ItemView) -> String {
         (selecting && selected.contains(item.id) ? Array(selected) : [item.id]).joined(separator: "\n")
+    }
+}
+
+/// "Select" toggle for a list of items: shown in the section header next to its title.
+struct SelectButton: View {
+    @Binding var selecting: Bool
+    @Binding var selected: Set<String>
+    var body: some View {
+        Button(selecting ? "Done" : "Select") { selecting.toggle(); if !selecting { selected = [] } }
+            .font(.rounded(13, .semibold))
+    }
+}
+
+/// While selecting, a bar along the bottom to move every ticked item into a category in one go.
+struct ItemSelectionBar: ViewModifier {
+    @Binding var selecting: Bool
+    @Binding var selected: Set<String>
+    let ledger: Ledger
+    var allIDs: [String] = []
+    @Environment(\.modelContext) private var context
+    @Environment(Toaster.self) private var toaster
+    @State private var picking = false
+
+    func body(content: Content) -> some View {
+        content
+            .safeAreaInset(edge: .bottom) {
+                if selecting {
+                    HStack {
+                        Text("\(selected.count) selected").font(.rounded(15, .bold))
+                        Spacer()
+                        if !allIDs.isEmpty {
+                            Button(selected.count == allIDs.count ? "None" : "All") { selected = selected.count == allIDs.count ? [] : Set(allIDs) }.buttonStyle(.bordered)
+                        }
+                        Button("Move to…") { picking = true }.buttonStyle(.borderedProminent).disabled(selected.isEmpty)
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 12).background(.regularMaterial)
+                }
+            }
+            .sheet(isPresented: $picking) {
+                CategoryPicker(title: "Move to…", teach: true) { category, remember, similar in
+                    let moving = ledger.items.filter { selected.contains($0.id) }
+                    Actions.assignCategory(moving, to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
+                    toaster.show("Moved \(moving.count) item\(moving.count == 1 ? "" : "s") to \(category?.name ?? "Unsorted")")
+                    selecting = false; selected = []
+                }
+            }
+    }
+}
+
+extension View {
+    func itemSelection(selecting: Binding<Bool>, selected: Binding<Set<String>>, ledger: Ledger, all: [ItemView] = []) -> some View {
+        modifier(ItemSelectionBar(selecting: selecting, selected: selected, ledger: ledger, allIDs: all.map(\.id)))
     }
 }
 
@@ -106,6 +169,7 @@ struct ItemSheet: View {
     @Environment(Toaster.self) private var toaster
     @State private var pickingCategory = false
     @State private var pickingTrip = false
+    @State private var renaming = false
 
     var body: some View {
         WithLedger { ledger in
@@ -128,7 +192,15 @@ struct ItemSheet: View {
                               (item.currency != nil && item.currency != "SGD") ? "\(item.currency!) \(String(format: "%.2f", item.price))" : nil]
                                 .compactMap { $0 }.joined(separator: " · ")).font(.rounded(13)).foregroundStyle(Theme.muted)
                     }
+                    if let printed = item.lineItem?.originalName, printed.lowercased() != item.name.lowercased() {
+                        Text("As printed: \(printed)").font(.rounded(13)).foregroundStyle(Theme.muted)
+                    }
                     Rows {
+                        if !item.isVirtual {
+                            Button { renaming = true } label: {
+                                MenuRow("Name", hint: "Rename it so your history reads the way you think of it") { Text(item.name).font(.rounded(14)).foregroundStyle(Theme.muted).lineLimit(1) }
+                            }.buttonStyle(.plain)
+                        }
                         Button { pickingCategory = true } label: {
                             MenuRow("Category") { CategoryChip(category: item.category, confidence: item.confidence, full: true) }
                         }.buttonStyle(.plain)
@@ -160,6 +232,12 @@ struct ItemSheet: View {
                 toaster.show(category.map { "Moved to \($0.name)" } ?? "Cleared")
             }
         }
+        .sheet(isPresented: $renaming) {
+            RenameSheet(current: item.name, printed: item.lineItem?.originalName ?? item.name) { name, remember in
+                do { try Actions.rename(item, to: name, remember: remember, in: context); toaster.show(remember ? "Renamed. It will use this name next time too" : "Renamed") }
+                catch { toaster.show(error.localizedDescription, error: true) }
+            }
+        }
         .sheet(isPresented: $pickingTrip) {
             TripPicker(current: item.trip) { trip in
                 if let t = item.transaction { Actions.assign(t, to: trip, in: context) }
@@ -168,6 +246,36 @@ struct ItemSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Rename an item, optionally for good: every receipt that prints the same text will use the new name.
+struct RenameSheet: View {
+    let current: String
+    let printed: String
+    let onSave: (String, Bool) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var remember = true
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section { TextField("Name", text: $name) } footer: { Text("Printed on the receipt as: \(printed)") }
+                Section {
+                    Toggle("Use this name whenever it appears again", isOn: $remember)
+                } footer: { Text("Matches the exact printed text, and also renames the ones you’ve already added.") }
+            }
+            .navigationTitle("Rename item").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") { onSave(name, remember); dismiss() }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .onAppear { name = current }
+        }
+        .presentationDetents([.medium])
     }
 }
 
@@ -213,12 +321,22 @@ struct CategoryPicker: View {
     @State private var expanded: Set<PersistentIdentifier> = []
     @State private var remember = true
     @State private var similar = false
+    @State private var creating: NewCategoryTarget?
+
+    /// Where a new category is being added; `parent == nil` means at the top level.
+    private struct NewCategoryTarget: Identifiable {
+        let parent: Category?
+        var id: String { parent.map { "\($0.persistentModelID.hashValue)" } ?? "top" }
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 if query.isEmpty {
                     ForEach(topLevel) { row($0, depth: 0) }
+                    Button { creating = NewCategoryTarget(parent: nil) } label: {
+                        Label("New top-level category", systemImage: "plus.circle").foregroundStyle(Theme.accent)
+                    }
                 } else {
                     ForEach(categories.filter { $0.path.joined(separator: " ").localizedCaseInsensitiveContains(query) }.sorted { $0.path.joined() < $1.path.joined() }) { category in
                         pick(category, subtitle: category.path.dropLast().joined(separator: " › "))
@@ -238,6 +356,10 @@ struct CategoryPicker: View {
             .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Cancel") { dismiss() } } }
             .onAppear { if let selected { expanded = Set(selected.pathIDs.dropLast()) } }
+            // a category made from here is what you were about to pick, so it's chosen straight away
+            .sheet(item: $creating) { target in
+                CategoryEditSheet(category: nil, parent: target.parent, onCreated: { made in onPick(made, remember, similar); dismiss() })
+            }
         }
         .presentationDetents([.large])
     }
@@ -271,6 +393,9 @@ struct CategoryPicker: View {
                         .buttonStyle(.borderless)
                 }
                 pick(category).buttonStyle(.borderless)
+                Button { creating = NewCategoryTarget(parent: category) } label: {
+                    Image(systemName: "plus.circle").frame(width: 28, height: 28).foregroundStyle(Theme.accent)
+                }.buttonStyle(.borderless).accessibilityLabel("New category inside \(category.name)")
             }
             .padding(.leading, CGFloat(depth) * 18)
             if open { ForEach(kids) { row($0, depth: depth + 1) } }
@@ -292,10 +417,13 @@ struct CategoryEditSheet: View {
     @State private var colorHex: String?
     @State private var confirmDelete = false
     var onDeleted: (() -> Void)?
+    /// Called with the new category after it's been created.
+    var onCreated: ((Category) -> Void)?
 
     private static let emoji = ["🍴", "🛒", "🚆", "🛏️", "🎟️", "🛍️", "🎁", "🏠", "💊", "☕", "🍜", "🎮", "📚", "💼", "✈️", "🐶", "🎬", "💇", "📱", "🧾"]
-    private static let swatches = ["ff8a75", "5d8df6", "7c83f5", "ffb066", "b36cf0", "f58bd0", "a5d86e", "4fd1a5", "c9a877", "f2c94c"]
+    private static let swatches = Category.palette.map { String($0.dropFirst()) }
     private var topLevel: Bool { category == nil ? parent == nil : category!.parent == nil }
+    private var parentName: String { (category?.parent ?? parent)?.name ?? "its parent" }
 
     var body: some View {
         NavigationStack {
@@ -307,15 +435,16 @@ struct CategoryEditSheet: View {
                         HStack { ForEach(Self.emoji, id: \.self) { e in Button(e) { icon = e }.font(.system(size: 26)).buttonStyle(.borderless) } }
                     }
                 }
-                if topLevel {
-                    Section {
-                        HStack { ForEach(Self.swatches, id: \.self) { hex in
+                Section {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 7), spacing: 12) {
+                        ForEach(Self.swatches, id: \.self) { hex in
                             Circle().fill(Color(hex: hex)).frame(width: 28, height: 28)
                                 .overlay { if colorHex?.lowercased().hasSuffix(hex) == true { Circle().stroke(Theme.text, lineWidth: 3) } }
                                 .onTapGesture { colorHex = "#" + hex }
-                        } }
-                    } header: { Text("Colour") } footer: { Text("Colour stays the same everywhere, so this category is always easy to spot.") }
-                }
+                        }
+                    }
+                    if !topLevel { Button("Same colour as \(parentName)") { colorHex = nil }.font(.rounded(14)) }
+                } header: { Text("Colour") } footer: { Text(topLevel ? "This is the colour of its slice on the Home chart." : "Sub-categories can have their own colour, so vegetables and meat are easy to tell apart inside Food.") }
                 Section {
                     TextField("No budget", text: $budget).keyboardType(.decimalPad)
                 } header: { Text("Monthly budget (optional)") } footer: { Text("Sets the green line on the spending map. Without one, your usual spending is the line.") }
@@ -354,7 +483,7 @@ struct CategoryEditSheet: View {
                 category.name = trimmed
                 category.icon = icon.isEmpty ? nil : icon
                 category.budgetSGD = budgetValue
-                if topLevel, let colorHex { category.colorHex = colorHex }
+                if topLevel { if let colorHex { category.colorHex = colorHex } } else { category.colorHex = colorHex }
                 try? context.save()
                 toaster.show("Saved")
             } else {
@@ -362,6 +491,9 @@ struct CategoryEditSheet: View {
                 made.budgetSGD = budgetValue
                 try? context.save()
                 toaster.show("Category added")
+                dismiss()
+                onCreated?(made)
+                return
             }
             dismiss()
         } catch { toaster.show(error.localizedDescription, error: true) }

@@ -81,7 +81,7 @@ struct TransactionView: View {
         WithLedger { ledger in
             let t = transaction
             let items = ledger.items(of: t)
-            let real = items.filter { !$0.isDeposit }
+            let real = items
             let incoming = t.transactionType != .expense
             let personal = real.reduce(0) { $0 + ($1.personalSGD ?? 0) }, others = real.reduce(0) { $0 + ($1.othersSGD ?? 0) }
             let single = real.count == 1 ? real[0] : nil
@@ -90,10 +90,21 @@ struct TransactionView: View {
             Screen {
                 hero(t, incoming: incoming, single: single, count: real.count, ledger: ledger)
                 if t.status == "needs_review" { reviewCard(t) }
+                if !incoming, let guess = single, guess.isVirtual, guess.confidence == .suggested, let category = guess.category {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Guessed category: \(category.path.suffix(2).joined(separator: " › "))").font(.rounded(15, .bold))
+                        if let note = guess.suggestionNote { Text(note).font(.rounded(13)).foregroundStyle(Theme.muted) }
+                        Text("Until you confirm it, this is counted as a guess, not as sorted.").font(.rounded(12)).foregroundStyle(Theme.muted)
+                        HStack {
+                            Button("Looks right") { Actions.acceptSuggestions([guess], ledger: ledger, in: context); toaster.show("Confirmed") }.buttonStyle(.borderedProminent)
+                            Button("Change") { pickingCategory = true }.buttonStyle(.bordered)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.orangeBg, bordered: false)
+                }
                 if incoming {
                     Rows {
                         NavigationLink(value: Route.classify(t)) {
-                            MenuRow(TransactionRow.incomingLabel[t.transactionType] ?? "Money in",
+                            MenuRow(t.incomeLabel ?? TransactionRow.incomingLabel[t.transactionType] ?? "Money in",
                                     hint: partialHint(t)) { Text("change").font(.rounded(13)).foregroundStyle(Theme.muted) }
                         }.buttonStyle(.plain)
                     }.flushCard()
@@ -118,11 +129,11 @@ struct TransactionView: View {
                                 MenuRow("Break down into categories", hint: "e.g. a Splitwise settlement made of food, transport and souvenirs")
                             }.buttonStyle(.plain)
                         }
-                        NavigationLink(value: Route.classify(t)) { MenuRow("Not a purchase?", hint: "Mark it as money in, a refund, or a transfer") }.buttonStyle(.plain)
+                        NavigationLink(value: Route.classify(t)) { MenuRow("Not a purchase?", hint: "Mark it as money in: a reimbursement, top up, or your own category") }.buttonStyle(.plain)
                     }.flushCard()
                 }
                 if real.count > 1 || (real.count == 1 && itemised) {
-                    SectionTitle("Items")
+                    SectionTitle("Items") { SelectButton(selecting: $selecting, selected: $selected) }
                     ItemList(items: items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -131,6 +142,7 @@ struct TransactionView: View {
                         .padding(10).background(Theme.bg, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }.card()
             }
+            .itemSelection(selecting: $selecting, selected: $selected, ledger: ledger, all: items)
             .navigationTitle("Transaction").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
                 Menu { Button("Delete transaction", systemImage: "trash", role: .destructive) { confirmDelete = true } } label: { Image(systemName: "ellipsis.circle") }
@@ -238,7 +250,7 @@ struct ReceiptView: View {
     var body: some View {
         WithLedger { ledger in
             let items = ledger.items(of: receipt)
-            let total = items.filter { !$0.isDeposit }.reduce(0) { $0 + ($1.priceSGD ?? 0) }
+            let total = items.reduce(0) { $0 + ($1.priceSGD ?? 0) }
             let linked = ledger.transactions.first { $0.matchedReceipt?.persistentModelID == receipt.persistentModelID }
             Screen {
                 VStack(alignment: .leading, spacing: 6) {
@@ -250,9 +262,10 @@ struct ReceiptView: View {
                 if let image = storedImage { image.resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous)) }
                 if let linked { NavigationLink(value: Route.transaction(linked)) { MenuRow("Open the linked transaction") }.buttonStyle(.plain).flushCard() }
                 else { candidates(ledger) }
-                SectionTitle("Items")
+                SectionTitle("Items") { SelectButton(selecting: $selecting, selected: $selected) }
                 ItemList(items: items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
             }
+            .itemSelection(selecting: $selecting, selected: $selected, ledger: ledger, all: items)
             .navigationTitle(receipt.merchant ?? "Receipt").navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $pickingTrip) { TripPicker(current: receipt.trip) { Actions.assign(receipt, to: $0, in: context); toaster.show("Trip updated") } }
             .sheet(isPresented: Binding(get: { openItemID != nil }, set: { if !$0 { openItemID = nil } })) { if let id = openItemID { ItemSheet(itemID: id) } }
@@ -379,18 +392,31 @@ struct ClassifyView: View {
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
     @Environment(Toaster.self) private var toaster
-    @State private var type = TransactionType.reimbursement
+    @Query(sort: \MoneyInLabel.sortOrder) private var labels: [MoneyInLabel]
+    @State private var type: TransactionType?
+    @State private var label: String?
     @State private var excessAsIncome = true
     @State private var refundOf: Receipt?
     @State private var loaded = false
+    @State private var addingLabel = false
+    @State private var newLabel = ""
 
-    private static let options: [(TransactionType, String, String, String)] = [
-        (.reimbursement, "🤝", "Reimbursement", "Reduces your “owed back” balance"),
-        (.income, "💰", "Allowance / Income", "Adds to your funds, not a reimbursement"),
-        (.transferOwnAccount, "🔁", "Transfer (my own account)", "Neither spending nor income"),
-        (.refund, "↩️", "Refund", "For a previous purchase"),
-        (.other, "•", "Other", "Something else"),
-    ]
+    private struct Option: Identifiable {
+        let type: TransactionType
+        let label: String?
+        let icon: String, title: String, hint: String
+        var id: String { "\(type.rawValue)/\(label ?? "")" }
+    }
+
+    /// Money in can only be a reimbursement, a top-up from your own account, or a category you made yourself.
+    /// (A refund is only offered when it was already marked as one.)
+    private var options: [Option] {
+        var list = [Option(type: .reimbursement, label: nil, icon: "🤝", title: "Reimbursement", hint: "Reduces your “owed back” balance"),
+                    Option(type: .transferOwnAccount, label: nil, icon: "🔁", title: "Top up", hint: "Money from your own account: not income")]
+        list += labels.map { Option(type: .income, label: $0.name, icon: "💰", title: $0.name, hint: "Your own category") }
+        if transaction.transactionType == .refund { list.append(Option(type: .refund, label: nil, icon: "↩️", title: "Refund", hint: "For a previous purchase")) }
+        return list
+    }
 
     var body: some View {
         WithLedger { ledger in
@@ -409,24 +435,32 @@ struct ClassifyView: View {
                 }.frame(maxWidth: .infinity)
                 Text("What is this?").font(.rounded(18, .bold))
                 Rows {
-                    ForEach(Self.options, id: \.0) { option in
-                        Button { type = option.0 } label: {
+                    ForEach(options) { option in
+                        let selected = type == option.type && label == option.label
+                        Button { type = option.type; label = option.label } label: {
                             HStack(spacing: 12) {
-                                IconTile(symbol: option.1, color: Theme.good, size: 36)
+                                IconTile(symbol: option.icon, color: Theme.good, size: 36)
                                 VStack(alignment: .leading, spacing: 1) {
                                     HStack(spacing: 6) {
-                                        Text(option.2).font(.rounded(15, .semibold))
-                                        if option.0 == .reimbursement && personToPerson && transaction.transactionType == .expense { Text("suggested").font(.rounded(11, .bold)).foregroundStyle(Theme.good) }
+                                        Text(option.title).font(.rounded(15, .semibold))
+                                        if option.type == .reimbursement && personToPerson && transaction.transactionType == .expense { Text("suggested").font(.rounded(11, .bold)).foregroundStyle(Theme.good) }
                                     }
-                                    Text(option.3).font(.rounded(12)).foregroundStyle(Theme.muted)
+                                    Text(option.hint).font(.rounded(12)).foregroundStyle(Theme.muted)
                                 }
                                 Spacer()
-                                if type == option.0 { Image(systemName: "checkmark").foregroundStyle(Theme.good).fontWeight(.bold) }
+                                if selected { Image(systemName: "checkmark").foregroundStyle(Theme.good).fontWeight(.bold) }
                             }
                             .padding(.horizontal, 14).padding(.vertical, 12)
-                            .background(type == option.0 ? Theme.good.opacity(0.1) : Color.clear).rowDivider()
+                            .background(selected ? Theme.good.opacity(0.1) : Color.clear).rowDivider()
                         }.buttonStyle(.plain)
                     }
+                    Button { newLabel = ""; addingLabel = true } label: {
+                        HStack(spacing: 12) {
+                            IconTile(symbol: "＋", color: Theme.accent, size: 36)
+                            Text("New category…").font(.rounded(15, .semibold)).foregroundStyle(Theme.accent)
+                            Spacer()
+                        }.padding(.horizontal, 14).padding(.vertical, 12).rowDivider()
+                    }.buttonStyle(.plain)
                 }.flushCard()
 
                 if excess {
@@ -448,7 +482,7 @@ struct ClassifyView: View {
                         Text("Linking it keeps the record straight. Category totals aren’t netted automatically yet.").font(.rounded(12)).foregroundStyle(Theme.muted)
                     }.card()
                 }
-                PrimaryButton(title: "Save") { save(amount: amount, owed: owed, excess: excess) }
+                if type != nil { PrimaryButton(title: "Save") { save(amount: amount, owed: owed, excess: excess) } }
                 if transaction.transactionType != .expense {
                     QuietButton(title: "Actually, this was a purchase") {
                         try? Actions.classify(transaction, as: .expense, in: context); toaster.show("Back to a normal purchase"); dismiss()
@@ -460,8 +494,20 @@ struct ClassifyView: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            if transaction.transactionType != .expense { type = transaction.transactionType; refundOf = transaction.refundsReceipt }
+            // a "+" row nobody has classified yet (.other) starts with nothing chosen
+            switch transaction.transactionType {
+            case .expense, .other: break
+            case .income where transaction.incomeLabel == nil: break
+            default: type = transaction.transactionType; label = transaction.incomeLabel; refundOf = transaction.refundsReceipt
+            }
         }
+        .alert("New money-in category", isPresented: $addingLabel) {
+            TextField("e.g. Allowance", text: $newLabel)
+            Button("Add") {
+                if let name = Actions.addMoneyInLabel(newLabel, in: context) { type = .income; label = name }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("For money in that isn’t a reimbursement or a top-up.") }
     }
 
     private func choice(_ text: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -471,11 +517,12 @@ struct ClassifyView: View {
     }
 
     private func save(amount: Double, owed: Double, excess: Bool) {
-        var finalType = type
+        guard var finalType = type else { return }
         var part: Double?
-        if type == .reimbursement && excess && excessAsIncome { if owed <= 0.005 { finalType = .income } else { part = owed } }
+        var finalLabel = label
+        if finalType == .reimbursement && excess && excessAsIncome { if owed <= 0.005 { finalType = .income; finalLabel = nil } else { part = owed } }
         do {
-            try Actions.classify(transaction, as: finalType, refunds: finalType == .refund ? refundOf : nil, reimbursementAmount: part, in: context)
+            try Actions.classify(transaction, as: finalType, refunds: finalType == .refund ? refundOf : nil, reimbursementAmount: part, label: finalLabel, in: context)
             toaster.show("Saved"); dismiss()
         } catch { toaster.show(error.localizedDescription, error: true) }
     }
