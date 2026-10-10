@@ -22,6 +22,8 @@ final class YouTripTransaction {
     /// How much of an incoming reimbursement actually reduces what's owed (nil = all of it); the
     /// excess over the outstanding balance is treated as income instead of a negative receivable.
     var reimbursementAmount: Double?
+    /// Which of the user's own money-in categories this is, when it's income ("Allowance", "Scholarship"...).
+    var incomeLabel: String?
 
     var matchedReceipt: Receipt?
     var trip: Trip?

@@ -9,7 +9,7 @@ class LedgerTestCase: XCTestCase {
 
     override func setUp() async throws {
         let schema = Schema([ExpenseTracker.Category.self, Trip.self, Receipt.self, LineItem.self, LineItemShare.self,
-                             YouTripTransaction.self, BalanceReconciliation.self, BalanceCheckpoint.self, ItemRule.self])
+                             YouTripTransaction.self, BalanceReconciliation.self, BalanceCheckpoint.self, ItemRule.self, MoneyInLabel.self])
         container = try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)])
         context = container.mainContext
         CategorySeeder.seedIfNeeded(in: context)
