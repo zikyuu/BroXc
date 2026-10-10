@@ -23,7 +23,7 @@ struct SearchView: View {
                 } else {
                     SegmentedTabs(options: [(Scope.all, "All"), (Scope.transactions, "Transactions"), (Scope.receipts, "Receipts"), (Scope.trips, "Trips")], selection: $scope)
                     if (scope == .all || scope == .transactions) && (!results.items.isEmpty || !extra.isEmpty) {
-                        SectionTitle("Transactions")
+                        SectionTitle("Transactions") { if !results.items.isEmpty { SelectButton(selecting: $selecting, selected: $selected) } }
                         if !results.items.isEmpty {
                             ItemList(items: Array(results.items.prefix(scope == .all ? 8 : 40)), selecting: $selecting, selected: $selected) { openItemID = $0.id }
                         }
@@ -60,6 +60,7 @@ struct SearchView: View {
                     }
                 }
             }
+            .itemSelection(selecting: $selecting, selected: $selected, ledger: ledger, all: results.items)
             .sheet(isPresented: Binding(get: { openItemID != nil }, set: { if !$0 { openItemID = nil } })) { if let id = openItemID { ItemSheet(itemID: id) } }
         }
         .navigationTitle("Search").navigationBarTitleDisplayMode(.inline)
@@ -317,14 +318,19 @@ struct CategoriesView: View {
 
 struct AddView: View {
     @Environment(\.modelContext) private var context
+    @Environment(\.dismiss) private var dismiss
+    @Environment(AppNavigation.self) private var navigation
     @Environment(Toaster.self) private var toaster
     @Query private var trips: [Trip]
     @State private var youtripPick: PhotosPickerItem?
+    @State private var photoPick: PhotosPickerItem?
     @State private var receiptPick: PhotosPickerItem?
     @State private var originalPick: PhotosPickerItem?
+    @State private var scanning = false
     @State private var working: String?
     @State private var youtripResult: String?
     @State private var receiptResult: String?
+    @State private var pendingTranslation: PendingTranslation?
 
     var body: some View {
         Screen {
@@ -332,6 +338,7 @@ struct AddView: View {
                 Text("🧳  New items will join \(trip.name)").font(.rounded(14, .semibold)).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12).background(Theme.greenBg, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
+            receiptCard
             VStack(alignment: .leading, spacing: 10) {
                 Text("YouTrip charges").font(.rounded(17, .bold))
                 Text("Screenshot your YouTrip transaction list. Overlapping screenshots are fine: charges you’ve already saved are skipped.").font(.rounded(13)).foregroundStyle(Theme.muted)
@@ -339,19 +346,42 @@ struct AddView: View {
                 if working == "youtrip" { ProgressView("Reading the image…") }
                 if let youtripResult { Text(youtripResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
             }.frame(maxWidth: .infinity, alignment: .leading).card()
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Receipt").font(.rounded(17, .bold))
-                Text("A Google Translate screenshot of the receipt (Swedish to English). Add the original photo too if you can: its store name helps match the charge.").font(.rounded(13)).foregroundStyle(Theme.muted)
-                PhotosPicker(selection: $receiptPick, matching: .images) { pickerLabel(receiptPick == nil ? "Translated screenshot" : "Translated screenshot ✓", systemImage: "doc.text.image") }
-                PhotosPicker(selection: $originalPick, matching: .images) { pickerLabel(originalPick == nil ? "Original photo (optional)" : "Original photo ✓", systemImage: "camera") }
-                PrimaryButton(title: "Read receipt", disabled: receiptPick == nil || working != nil) { Task { await readReceipt() } }
-                if working == "receipt" { ProgressView("Reading the image…") }
-                if let receiptResult { Text(receiptResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
-            }.frame(maxWidth: .infinity, alignment: .leading).card()
             NavigationLink(value: Route.review) { Text("See what needs a look").font(.rounded(15, .semibold)).frame(maxWidth: .infinity).padding(.vertical, 12) }.buttonStyle(.bordered)
         }
         .navigationTitle("Add").navigationBarTitleDisplayMode(.inline)
+        .translationHost($pendingTranslation)
         .onChange(of: youtripPick) { _, item in if let item { Task { await readCharges(item) } } }
+        .onChange(of: photoPick) { _, item in if let item { Task { await readPhoto(item) } } }
+        .fullScreenCover(isPresented: $scanning) {
+            DocumentScanner(onScan: { image in scanning = false; if let data = image.pngData() { Task { await addReceiptPhoto(data) } } },
+                            onCancel: { scanning = false }).ignoresSafeArea()
+        }
+    }
+
+    private var receiptCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Receipt").font(.rounded(17, .bold))
+            Text("Photograph the receipt as it is. It’s read in Swedish and the item names are translated to English on this phone. Nothing is sent anywhere.")
+                .font(.rounded(13)).foregroundStyle(Theme.muted)
+            HStack(spacing: 10) {
+                if DocumentScanner.isSupported {
+                    Button { scanning = true } label: { pickerLabel("Scan", systemImage: "camera.viewfinder") }.disabled(working != nil)
+                }
+                PhotosPicker(selection: $photoPick, matching: .images) { pickerLabel("Choose photo", systemImage: "photo") }.disabled(working != nil)
+            }
+            if working == "receipt" { ProgressView("Reading the receipt…") }
+            if working == "translating" { ProgressView("Translating item names…") }
+            if let receiptResult { Text(receiptResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
+            DisclosureGroup("Already have a Google Translate screenshot?") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Add the translated screenshot, and the original photo too if you can: its store name helps match the charge.").font(.rounded(13)).foregroundStyle(Theme.muted)
+                    PhotosPicker(selection: $receiptPick, matching: .images) { pickerLabel(receiptPick == nil ? "Translated screenshot" : "Translated screenshot ✓", systemImage: "doc.text.image") }
+                    PhotosPicker(selection: $originalPick, matching: .images) { pickerLabel(originalPick == nil ? "Original photo (optional)" : "Original photo ✓", systemImage: "camera") }
+                    PrimaryButton(title: "Read translated screenshot", disabled: receiptPick == nil || working != nil) { Task { await readTranslatedScreenshot() } }
+                }.padding(.top, 8)
+            }
+            .font(.rounded(14, .semibold)).tint(Theme.accent)
+        }.frame(maxWidth: .infinity, alignment: .leading).card()
     }
 
     private func pickerLabel(_ title: String, systemImage: String) -> some View {
@@ -372,7 +402,35 @@ struct AddView: View {
         } catch { toaster.show(error.localizedDescription, error: true) }
     }
 
-    private func readReceipt() async {
+    private func readPhoto(_ item: PhotosPickerItem) async {
+        defer { photoPick = nil }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else { throw AppError("That image couldn’t be opened.") }
+            await addReceiptPhoto(data)
+        } catch { toaster.show(error.localizedDescription, error: true) }
+    }
+
+    /// One photo of the original receipt: read it, translate the item names, save, and try to link it to its charge.
+    private func addReceiptPhoto(_ data: Data) async {
+        working = "receipt"; receiptResult = nil
+        defer { working = nil }
+        do {
+            guard let image = ImageLoader.cgImage(from: data) else { throw AppError("That image couldn’t be opened.") }
+            var draft = try await ReceiptReader.readOriginalPhoto(image, sourceImagePath: ImageLoader.store(data))
+            if draft.items.isEmpty && draft.total == nil { throw AppError("Couldn’t read anything from that image. Try a clearer photo, or use Scan.") }
+            working = "translating"
+            let outcome = await translateOnDevice(ReceiptTranslation.texts(draft), via: $pendingTranslation)
+            draft = ReceiptTranslation.apply(outcome.texts, to: draft)
+            let receipt = Actions.save(draft, in: context)
+            let matched = Matcher.run(in: context).first { $0.receipt === receipt }
+            if outcome.texts == nil {
+                // stay here: the reason it couldn't translate is worth reading
+                receiptResult = summary(draft, matched: matched) + " Couldn’t translate, so item names are shown as printed. Reason: \(outcome.problem ?? "unknown")"
+            } else { finishAdding(draft, matched: matched) }
+        } catch { toaster.show(error.localizedDescription, error: true) }
+    }
+
+    private func readTranslatedScreenshot() async {
         guard let pick = receiptPick else { return }
         working = "receipt"; receiptResult = nil
         defer { working = nil; receiptPick = nil; originalPick = nil }
@@ -383,10 +441,20 @@ struct AddView: View {
             let draft = try await ReceiptReader.readReceipt(translated: image, original: original, sourceImagePath: ImageLoader.store(data))
             if draft.items.isEmpty && draft.total == nil { throw AppError("Couldn’t read anything from that image. Try a clearer screenshot.") }
             let receipt = Actions.save(draft, in: context)
-            let matched = Matcher.run(in: context).first { $0.receipt === receipt }
-            receiptResult = "Read “\(draft.merchant ?? "unknown store")”: \(draft.items.count) item\(draft.items.count == 1 ? "" : "s"), total \(draft.currency ?? "") \(draft.total.map { String(format: "%.2f", $0) } ?? "?"). "
-                + (matched != nil ? "Linked to a YouTrip charge\(matched!.needsReview ? " (worth a look)" : "")." : "No matching YouTrip charge yet.")
+            finishAdding(draft, matched: Matcher.run(in: context).first { $0.receipt === receipt })
         } catch { toaster.show(error.localizedDescription, error: true) }
+    }
+
+    /// A receipt is in: go to Activity (where it now is) instead of leaving you on this page.
+    private func finishAdding(_ draft: ReceiptDraft, matched: Matcher.Result?) {
+        toaster.show("Added \(draft.merchant ?? "receipt"): \(draft.items.count) item\(draft.items.count == 1 ? "" : "s")" + (matched != nil ? ", linked ✓" : ", no charge yet"))
+        dismiss()
+        navigation.selectedTab = .activity
+    }
+
+    private func summary(_ draft: ReceiptDraft, matched: Matcher.Result?) -> String {
+        "Read “\(draft.merchant ?? "unknown store")”: \(draft.items.count) item\(draft.items.count == 1 ? "" : "s"), total \(draft.currency ?? "") \(draft.total.map { String(format: "%.2f", $0) } ?? "?"). "
+            + (matched != nil ? "Linked to a YouTrip charge\(matched!.needsReview ? " (worth a look)" : "")." : "No matching YouTrip charge yet.")
     }
 }
 

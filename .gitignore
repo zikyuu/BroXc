@@ -17,3 +17,6 @@ xcuserdata/
 DerivedData/
 # ...but the asset catalog's Contents.json files do (the *.json rule above would swallow them)
 !ios/**/Contents.json
+
+# personal receipt photo used by the OCR tests
+ica_receipt.jpg

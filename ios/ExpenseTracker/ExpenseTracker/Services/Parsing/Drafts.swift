@@ -3,6 +3,8 @@ import Foundation
 /// What the receipt parser hands back: suggestions only, nothing is saved until the app writes it.
 struct ParsedLineItem {
     var name: String
+    /// Set when `name` has been translated: the text as printed.
+    var originalName: String?
     var price: Double
     var quantity: Double? = 1
     var originalPrice: Double?
@@ -33,4 +35,6 @@ struct ParsedTransaction: Equatable {
     var amountSGD: Double?
     var localAmount: Double?
     var localCurrency: String?
+    /// What the description suggests: a top-up or refund is not a purchase. Only a suggestion - the user can change it.
+    var transactionType: TransactionType = .expense
 }

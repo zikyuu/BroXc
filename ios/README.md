@@ -29,6 +29,16 @@ on the first screen to load made-up spending.
 A free-signed app stops opening after **7 days**. Plug in and press Run again to refresh it. Your data stays on
 the phone and is untouched by that (it lives in the app's own storage, not in the signature).
 
+## Adding a receipt
+
+Photograph the receipt as it is (**Scan** uses Apple's document camera to flatten a crumpled or skewed receipt;
+**Choose photo** takes one from your library). It's read in Swedish with Apple Vision, and the item names are
+translated to English on the phone with Apple's Translation framework, with the printed text kept alongside.
+Translation needs iOS 18+ and a one-time language download; without it, names simply stay as printed. The older
+route (a Google Translate screenshot) is still there under "Already have a Google Translate screenshot?".
+
+Not verifiable in the simulator: the camera scan and the translation itself. Try both on a real iPhone.
+
 ## Tests
 
 ```bash
