@@ -251,7 +251,7 @@ extension Ledger {
         var own: [PersistentIdentifier?: Double] = [:]
         var count: [PersistentIdentifier?: Int] = [:]
         var unconverted: [String: Double] = [:]
-        for item in items(in: range, trip: trip) where !item.isDeposit {
+        for item in items(in: range, trip: trip) {
             guard let personal = item.personalSGD else { unconverted[item.currency ?? "?", default: 0] += item.personalPrice; continue }
             if personal == 0 { continue }  // paid entirely for someone else: not personal spend anywhere
             let key = item.category?.persistentModelID
@@ -358,10 +358,20 @@ extension Ledger {
         reconciliations.filter { MonthKey($0.reconciledOn) == month && $0.untrackedSGD > 0 }.reduce(0) { $0 + $1.untrackedSGD }
     }
 
+    // MARK: bottle deposit
+
+    /// Deposit paid at the till vs. credited back for returned bottles (a negative deposit line), in SGD.
+    static func pantSummary(_ items: [ItemView]) -> (paid: Double, returned: Double, net: Double) {
+        let deposits = items.filter(\.isDeposit).compactMap(\.priceSGD)
+        let paid = round2(deposits.filter { $0 > 0 }.reduce(0, +))
+        let returned = round2(-deposits.filter { $0 < 0 }.reduce(0, +))
+        return (paid, returned, round2(paid - returned))
+    }
+
     // MARK: activity
 
     private func entryCategory(_ group: [ItemView]) -> EntryCategory? {
-        let real = group.filter { !$0.isDeposit }
+        let real = group
         guard let top = real.max(by: { abs($0.priceSGD ?? 0) < abs($1.priceSGD ?? 0) }) else { return nil }
         let distinct = Set(real.map { $0.category?.persistentModelID })
         return EntryCategory(category: top.category, confidence: top.confidence, mixed: distinct.count > 1, distinct: distinct.count)
@@ -371,7 +381,7 @@ extension Ledger {
         var entries: [ActivityEntry] = []
         for t in transactions {
             let group = items(of: t)
-            let real = group.filter { !$0.isDeposit }
+            let real = group
             let status: String
             if t.transactionType != .expense { status = "not_expense" } else { status = t.status }
             entries.append(ActivityEntry(
@@ -386,7 +396,7 @@ extension Ledger {
         let matched = Set(transactions.compactMap { $0.matchedReceipt?.persistentModelID })
         for receipt in receipts where !matched.contains(receipt.persistentModelID) {
             let group = items(of: receipt)
-            let real = group.filter { !$0.isDeposit }
+            let real = group
             guard !real.isEmpty else { continue }
             let known = real.allSatisfy { $0.priceSGD != nil }
             entries.append(ActivityEntry(
@@ -559,7 +569,7 @@ extension Ledger {
 
     func tripSummaries() -> [TripSummary] {
         var spend: [PersistentIdentifier: (Double, Int)] = [:]
-        for item in items where !item.isDeposit {
+        for item in items {
             guard let trip = item.trip else { continue }
             let current = spend[trip.persistentModelID] ?? (0, 0)
             spend[trip.persistentModelID] = (current.0 + (item.personalSGD ?? 0), current.1 + 1)
@@ -572,7 +582,7 @@ extension Ledger {
     func travelSummary() -> TravelSummary {
         let summaries = tripSummaries()
         var byRoot: [PersistentIdentifier?: Double] = [:]
-        for item in items where item.trip != nil && !item.isDeposit {
+        for item in items where item.trip != nil {
             if let personal = item.personalSGD, personal != 0 { byRoot[item.rootCategoryID, default: 0] += personal }
         }
         let byID = Dictionary(uniqueKeysWithValues: topLevel.map { ($0.persistentModelID as PersistentIdentifier?, $0) })

@@ -6,12 +6,16 @@ import SwiftData
 /// in the Python backend - an append-only correction cache, not a model being retrained.
 @Model
 final class ItemRule {
-    var name: String = ""      // lower-cased, trimmed
+    /// The item as printed on the receipt, lower-cased and trimmed.
+    var name: String = ""
     var category: Category?
+    /// What the user renamed it to ("Romantica RosaBand" -> "Cherry tomatoes"), applied whenever it's printed again.
+    var displayName: String?
 
-    init(name: String, category: Category?) {
+    init(name: String, category: Category?, displayName: String? = nil) {
         self.name = name
         self.category = category
+        self.displayName = displayName
     }
 
     static func key(_ itemName: String) -> String { itemName.trimmingCharacters(in: .whitespaces).lowercased() }

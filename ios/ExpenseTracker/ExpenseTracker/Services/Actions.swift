@@ -29,11 +29,22 @@ enum Actions {
                               suggestedCategory: draft.suggestedCategory, ocrConfidence: draft.ocrConfidence,
                               rawText: draft.rawText, sourceImagePath: draft.sourceImagePath, trip: activeTrip(context))
         context.insert(receipt)
+        // names the user has renamed before: the same printed text gets the same name again
+        let aliases = Dictionary(((try? context.fetch(FetchDescriptor<ItemRule>())) ?? []).compactMap { r in r.displayName.map { (r.name, $0) } },
+                                 uniquingKeysWith: { first, _ in first })
+        var lastProduct: LineItem?
         for (index, parsed) in draft.items.enumerated() {
             let item = LineItem(name: parsed.name, price: parsed.price, quantity: parsed.quantity,
                                 originalPrice: parsed.originalPrice, discount: parsed.discount,
                                 isDeposit: parsed.isDeposit, tags: parsed.tags)
             item.position = index
+            item.originalName = parsed.originalName
+            if let alias = aliases[ItemRule.key(parsed.originalName ?? parsed.name)] {
+                item.originalName = parsed.originalName ?? parsed.name
+                item.name = alias
+            }
+            // a deposit paid at the till belongs to the product printed just above it; a returned-bottle credit (negative) is nobody's
+            if parsed.isDeposit { if parsed.price > 0 { item.parentUID = lastProduct?.uid } } else { lastProduct = item }
             item.receipt = receipt
             context.insert(item)
         }
@@ -41,24 +52,51 @@ enum Actions {
         return receipt
     }
 
-    /// Saves parsed transactions, skipping ones already stored. Screenshots overlap when you scroll, but
-    /// two identical rows can also be genuine (two 10 kr rides in a day) - so this compares counts: if the
-    /// database already holds N copies of a row, the first N in the upload are the same ones.
+    /// Is this freshly-read row the same charge as one already saved? Amounts must agree exactly (they're the reliable
+    /// part of a read). The date must agree too - unless the new row has none, which happens when a screenshot starts
+    /// partway down a day and that day's header has scrolled off. The description only has to be *similar*, since the
+    /// same row read from a different crop can differ by a stray symbol or a name cut off at the edge.
+    static func isSameCharge(_ row: ParsedTransaction, as old: YouTripTransaction) -> Bool {
+        func close(_ a: Double?, _ b: Double?) -> Bool {
+            switch (a, b) {
+            case (nil, nil): return true
+            case let (x?, y?): return abs(abs(x) - abs(y)) < 0.005
+            default: return false
+            }
+        }
+        guard close(row.amountSGD, old.amountSGD), close(row.localAmount, old.localAmount),
+              (row.localCurrency ?? "").uppercased() == (old.localCurrency ?? "").uppercased() else { return false }
+
+        var dateUnknown = false
+        if let newDate = row.date, let oldDate = old.date {
+            if !Dates.calendar.isDate(newDate, inSameDayAs: oldDate) { return false }
+        } else { dateUnknown = true }
+
+        let a = (row.description ?? "").trimmingCharacters(in: .whitespaces), b = (old.transactionDescription ?? "").trimmingCharacters(in: .whitespaces)
+        if a.isEmpty || b.isEmpty { return !dateUnknown }   // nothing to compare names on: only trust it with a known date
+        // a missing date is the weaker evidence, so ask more of the name
+        return Fuzzy.partialRatio(a, b) >= (dateUnknown ? 85 : 70)
+    }
+
+    /// Saves parsed transactions, skipping ones already stored. Screenshots overlap when you scroll, but two identical
+    /// rows can also be genuine (two 10 kr rides in a day) - so each saved charge can account for only ONE row of the
+    /// upload: the first N identical rows match the N copies already held, and a further one is genuinely new.
     static func saveNew(_ parsed: [ParsedTransaction], in context: ModelContext) -> (added: Int, skipped: Int) {
-        func key(_ date: Date?, _ description: String?, _ sgd: Double?, _ local: Double?, _ currency: String?) -> String {
-            "\(date?.timeIntervalSince1970 ?? 0)|\(description ?? "")|\(sgd ?? 0)|\(local ?? 0)|\(currency ?? "")"
-        }
-        var existing: [String: Int] = [:]
-        for t in (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? [] {
-            existing[key(t.date, t.transactionDescription, t.amountSGD, t.localAmount, t.localCurrency), default: 0] += 1
-        }
+        let existing = (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []
+        var claimed = Set<PersistentIdentifier>()
         let trip = activeTrip(context)
         var added = 0, skipped = 0
         for row in parsed {
-            let k = key(row.date, row.description, row.amountSGD, row.localAmount, row.localCurrency)
-            if existing[k, default: 0] > 0 { existing[k]! -= 1; skipped += 1; continue }
+            // prefer a dated match over a date-less one when both could fit
+            let candidates = existing.filter { !claimed.contains($0.persistentModelID) && isSameCharge(row, as: $0) }
+            if let match = candidates.first(where: { $0.date != nil && row.date != nil }) ?? candidates.first {
+                claimed.insert(match.persistentModelID)
+                skipped += 1
+                continue
+            }
             let t = YouTripTransaction(date: row.date, description: row.description, amountSGD: row.amountSGD,
-                                       localAmount: row.localAmount, localCurrency: row.localCurrency, trip: trip)
+                                       localAmount: row.localAmount, localCurrency: row.localCurrency,
+                                       transactionType: row.transactionType, trip: row.transactionType == .expense ? trip : nil)
             context.insert(t)
             added += 1
         }
@@ -127,15 +165,39 @@ enum Actions {
         for view in items {
             let line = lineItem(for: view, in: context)
             line.category = category
-            names.append(line.name)
+            // remembered by the name as printed: translations of the same product can vary, the printed text doesn't
+            names.append(line.originalName ?? line.name)
         }
         if alsoSimilar, let category {
             let wanted = Set(names.map(ItemRule.key))
-            for other in ledger.items where other.confidence != .confirmed && wanted.contains(ItemRule.key(other.name)) {
+            for other in ledger.items where other.confidence != .confirmed && wanted.contains(ItemRule.key(other.lineItem?.originalName ?? other.name)) {
                 lineItem(for: other, in: context).category = category
             }
         }
         if remember, let category { for name in names { learn(name, category, in: context) } }
+        try? context.save()
+    }
+
+    /// Renames a receipt item. The text as printed is kept as evidence. With `remember`, the same printed name gets
+    /// this name on every later receipt and on past ones too.
+    static func rename(_ item: ItemView, to newName: String, remember: Bool, in context: ModelContext) throws {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AppError("A name can’t be empty.") }
+        guard let line = item.lineItem else { throw AppError("Only items read from a receipt can be renamed.") }
+        let printed = line.originalName ?? line.name
+        line.originalName = printed
+        line.name = trimmed
+        if remember {
+            let key = ItemRule.key(printed)
+            let restored = trimmed.lowercased() == printed.lowercased()
+            let existing = ((try? context.fetch(FetchDescriptor<ItemRule>())) ?? []).first { $0.name == key }
+            if let existing { existing.displayName = restored ? nil : trimmed }
+            else if !restored { context.insert(ItemRule(name: key, category: nil, displayName: trimmed)) }
+            for other in (try? context.fetch(FetchDescriptor<LineItem>())) ?? [] where ItemRule.key(other.originalName ?? other.name) == key {
+                other.originalName = other.originalName ?? other.name
+                other.name = trimmed
+            }
+        }
         try? context.save()
     }
 
@@ -218,7 +280,7 @@ enum Actions {
     /// trip it was auto-tagged into. Turning an expense into something else also drops the hand-made receipt
     /// standing in for it; a receipt read off a photo is kept and simply becomes unmatched.
     static func classify(_ t: YouTripTransaction, as type: TransactionType, refunds: Receipt? = nil,
-                         reimbursementAmount: Double? = nil, in context: ModelContext) throws {
+                         reimbursementAmount: Double? = nil, label: String? = nil, in context: ModelContext) throws {
         if let reimbursementAmount, !(0...(abs(t.amountSGD ?? 0) + tolerance)).contains(reimbursementAmount) {
             throw AppError("The reimbursed part can’t be more than the payment itself.")
         }
@@ -226,14 +288,28 @@ enum Actions {
             t.transactionType = .expense
             t.refundsReceipt = nil
             t.reimbursementAmount = nil
+            t.incomeLabel = nil
         } else {
             if let receipt = t.matchedReceipt, !receipt.isItemised { removeReceipt(receipt, in: context) }
             t.transactionType = type
             t.refundsReceipt = type == .refund ? refunds : nil
             t.reimbursementAmount = type == .reimbursement ? reimbursementAmount : nil
+            t.incomeLabel = type == .income ? label : nil
             t.matchedReceipt = nil; t.matchStatus = nil; t.matchNote = nil; t.trip = nil
         }
         try? context.save()
+    }
+
+    /// Adds a money-in category (case-insensitively unique) and returns the stored name.
+    @discardableResult
+    static func addMoneyInLabel(_ name: String, in context: ModelContext) -> String? {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        let existing = (try? context.fetch(FetchDescriptor<MoneyInLabel>())) ?? []
+        if let same = existing.first(where: { $0.name.lowercased() == clean.lowercased() }) { return same.name }
+        context.insert(MoneyInLabel(name: clean, sortOrder: existing.count))
+        try? context.save()
+        return clean
     }
 
     static func setNote(_ t: YouTripTransaction, _ note: String?, in context: ModelContext) {
@@ -364,8 +440,15 @@ enum Actions {
         }
         let order = (siblings.map(\.sortOrder).max() ?? -1) + 1
         var color = colorHex
-        if parent == nil && color == nil { color = Category.topLevelColors[order % Category.topLevelColors.count] }
-        let category = Category(name: trimmed, parent: parent, colorHex: parent == nil ? color : nil, icon: icon, sortOrder: order)
+        if color == nil {
+            if parent == nil { color = Category.topLevelColors[order % Category.topLevelColors.count] }
+            else {
+                // a new sub-category gets a colour none of its siblings has, so they're told apart at a glance
+                let used = Set(siblings.compactMap { $0.colorHex?.lowercased() })
+                color = Category.palette.first { !used.contains($0) }
+            }
+        }
+        let category = Category(name: trimmed, parent: parent, colorHex: color, icon: icon, sortOrder: order)
         context.insert(category)
         try? context.save()
         return category

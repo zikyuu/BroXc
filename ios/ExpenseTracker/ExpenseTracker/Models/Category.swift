@@ -6,8 +6,7 @@ import SwiftData
 @Model
 final class Category {
     var name: String = ""
-    /// Only meaningful at the top level — a sub-category's colour is always read through
-    /// `effectiveColorHex`, since colour is identity, not something that changes per level.
+    /// Optional at every level; read through `effectiveColorHex`, which falls back to the parent's colour.
     var colorHex: String?
     var icon: String?
     var budgetSGD: Double?
@@ -73,11 +72,24 @@ final class Category {
         return node
     }
 
-    /// A sub-category takes its top-level ancestor's colour, because colour is for identity and a
-    /// Meat tile should read as Food at a glance.
+    /// The category's own colour if it has one, otherwise its nearest coloured ancestor's. Top-level categories give
+    /// the Home chart its wedges; a sub-category with its own colour (Vegetables green, Meat red) stands out inside
+    /// its parent, and one without just reads as its parent.
     var effectiveColorHex: String {
-        root.colorHex ?? Category.fallbackColorHex
+        var node: Category? = self
+        var seen = Set<PersistentIdentifier>()
+        while let current = node, seen.insert(current.persistentModelID).inserted {
+            if let hex = current.colorHex { return hex }
+            node = current.parent
+        }
+        return Category.fallbackColorHex
     }
+
+    /// Colours offered when editing a category, and drawn from for new sub-categories.
+    static let palette = [
+        "#e5635a", "#ff8a75", "#f08a24", "#f2c94c", "#a5d86e", "#5fbf6a", "#4fd1a5", "#4fb6d9",
+        "#5d8df6", "#7c83f5", "#b36cf0", "#f58bd0", "#c9a877", "#9b6b4f",
+    ]
 
     static let fallbackColorHex = "#a9a39a"
 

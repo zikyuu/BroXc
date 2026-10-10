@@ -67,6 +67,10 @@ struct ItemView: Identifiable {
     let merchant: String?
     /// Read off a real receipt, vs. typed in by hand. Only an itemised one can be decomposed.
     let itemised: Bool
+    /// Why a suggested category was suggested, when it's worth saying ("Guessed from your past ICA purchases").
+    var suggestionNote: String? = nil
+    /// For a bottle deposit paid with a product: that product's item id.
+    var parentID: String? = nil
 
     var isVirtual: Bool { lineItem == nil }
     var rootCategoryID: PersistentIdentifier? { category?.root.persistentModelID }
@@ -102,7 +106,7 @@ struct Ledger {
         let lookup = CategoryLookup(categories)
         self.lookup = lookup
         let learned = Dictionary(rules.compactMap { r in r.category.map { (r.name, $0) } }, uniquingKeysWith: { first, _ in first })
-        self.items = Ledger.buildItems(receipts: receipts, transactions: transactions, lookup: lookup, learned: learned)
+        self.items = Ledger.buildItems(receipts: receipts, transactions: transactions, lookup: lookup, learned: learned, depositCategory: categories.first { $0.kind == .deposit })
     }
 
     /// A fresh ledger over everything currently stored.
@@ -134,7 +138,7 @@ struct Ledger {
     }
 
     private static func buildItems(receipts: [Receipt], transactions: [YouTripTransaction],
-                                   lookup: CategoryLookup, learned: [String: Category]) -> [ItemView] {
+                                   lookup: CategoryLookup, learned: [String: Category], depositCategory: Category?) -> [ItemView] {
         let reference = referenceRates(transactions)
         var transactionForReceipt: [PersistentIdentifier: YouTripTransaction] = [:]
         for t in transactions { if let r = t.matchedReceipt { transactionForReceipt[r.persistentModelID] = t } }
@@ -143,7 +147,13 @@ struct Ledger {
             let code = (receipt.currency ?? "").uppercased()
             if code == "SGD" { return (1, .native) }
             if let t = transactionForReceipt[receipt.persistentModelID], let sgd = t.amountSGD, sgd > 0,
-               let total = receipt.total, total > 0 { return (total / sgd, .matched) }   // what actually left the card
+               let total = receipt.total, total > 0 {
+                let matched = total / sgd   // what actually left the card
+                // a rate more than half off the usual one means a misread total or a wrong link; trusting it would
+                // distort every price on the receipt, so fall back to the usual rate (flagged as an estimate)
+                if let usual = reference[code], abs(matched - usual) / usual > 0.5 { return (usual, .estimated) }
+                return (matched, .matched)
+            }
             if let usual = reference[code] { return (usual, .estimated) }
             return nil
         }
@@ -164,10 +174,24 @@ struct Ledger {
         }
         let hints: [String: Category] = votes.compactMapValues { $0.values.max { $0.1 < $1.1 }?.0 }
 
-        func resolve(explicit: Category?, name: String = "", tags: [String], itemised: Bool) -> (Category?, CategoryConfidence) {
+        /// A guess made from a merchant's history is about the shop, not about this particular purchase, so it never
+        /// gets more specific than the shop's usual kind of spend: a supermarket that mostly sold you meat suggests
+        /// "Grocery Shopping", not "Meat" - the charge might just as well be one drink.
+        func broadened(_ category: Category) -> Category {
+            var node: Category? = category
+            while let current = node {
+                if let grocery = current.children.first(where: { $0.kind == .grocery }) { return grocery }
+                node = current.parent
+            }
+            return category
+        }
+
+        func resolve(explicit: Category?, name: String = "", original: String? = nil, tags: [String], itemised: Bool, deposit: Bool = false) -> (Category?, CategoryConfidence) {
+            // a bottle deposit is a deposit by definition: it files itself under Pant, not as a guess
+            if deposit, explicit == nil, let depositCategory { return (depositCategory, .confirmed) }
             var category = explicit
             var confidence: CategoryConfidence = explicit != nil ? .confirmed : .unknown
-            if category == nil, let remembered = learned[ItemRule.key(name)] { category = remembered; confidence = .suggested }
+            if category == nil, let remembered = learned[ItemRule.key(original ?? name)] ?? learned[ItemRule.key(name)] { category = remembered; confidence = .suggested }
             if category == nil, let guess = lookup.infer(from: tags) { category = guess; confidence = .suggested }
             // a known grocery spend with no receipt can't be split into meat/veg/etc until one turns up
             if let found = category, !itemised, let grocery = found.children.first(where: { $0.kind == .grocery }) {
@@ -180,10 +204,16 @@ struct Ledger {
         for receipt in receipts {
             let transaction = transactionForReceipt[receipt.persistentModelID]
             let rateInfo = rate(for: receipt)
+            var resolvedByUID: [String: (Category?, CategoryConfidence)] = [:]
             for item in receipt.lineItems.sorted(by: { $0.position < $1.position }) {
                 let split = item.split
-                let (category, confidence) = resolve(explicit: item.category, name: item.name, tags: item.tags, itemised: receipt.isItemised)
-                result.append(ItemView(
+                var (category, confidence) = resolve(explicit: item.category, name: item.name, original: item.originalName, tags: item.tags, itemised: receipt.isItemised, deposit: item.isDeposit)
+                // a deposit follows the drink it was paid with, wherever the drink goes
+                if item.isDeposit, item.category == nil, let parent = item.parentUID, let parentResolved = resolvedByUID[parent] {
+                    (category, confidence) = parentResolved
+                }
+                resolvedByUID[item.uid] = (category, confidence)
+                var view = ItemView(
                     id: item.uid, lineItem: item, transaction: transaction, receipt: receipt,
                     name: item.name, quantity: item.quantity, isDeposit: item.isDeposit, price: item.price,
                     currency: receipt.currency,
@@ -194,7 +224,9 @@ struct Ledger {
                     sgdSource: rateInfo?.1, splitMode: item.splitMode, splitUnresolved: split.unresolved,
                     tags: item.tags, category: category, confidence: confidence, trip: receipt.trip,
                     matchStatus: transaction?.matchStatus, date: receipt.date, merchant: receipt.merchant,
-                    itemised: receipt.isItemised))
+                    itemised: receipt.isItemised)
+                view.parentID = item.parentUID
+                result.append(view)
             }
         }
 
@@ -203,24 +235,27 @@ struct Ledger {
         for t in transactions where t.transactionType == .expense && t.matchedReceipt == nil {
             let amount = t.amountSGD ?? 0
             var guess: Category?
+            var guessedFrom: String?
             if let description = t.transactionDescription?.lowercased(), !description.isEmpty {
                 var bestLength = 0
                 for (merchant, category) in hints {
                     for word in merchant.lowercased().split(separator: " ")
                     where word.count >= minHintWordLength && word.count > bestLength && description.contains(word) {
-                        guess = category; bestLength = word.count
+                        guess = broadened(category); bestLength = word.count; guessedFrom = merchant
                     }
                 }
             }
             let (category, confidence) = resolve(explicit: nil, tags: [], itemised: false)
             let finalCategory = guess ?? category
-            result.append(ItemView(
+            var view = ItemView(
                 id: "txn-" + t.uid, lineItem: nil, transaction: t, receipt: nil,
                 name: t.transactionDescription ?? "Unknown charge", quantity: 1, isDeposit: false,
                 price: amount, currency: "SGD", priceSGD: amount, personalPrice: amount, personalSGD: amount,
                 othersSGD: 0, sgdSource: .native, splitMode: .mine, splitUnresolved: false, tags: [],
                 category: finalCategory, confidence: guess != nil ? .suggested : confidence, trip: t.trip,
-                matchStatus: nil, date: t.date, merchant: "No receipt yet", itemised: false))
+                matchStatus: nil, date: t.date, merchant: "No receipt yet", itemised: false)
+            if guess != nil, let guessedFrom { view.suggestionNote = "Guessed from your past purchases at \(guessedFrom): there’s no receipt for this one, so it may not be the same kind of spend." }
+            result.append(view)
         }
         return result
     }
@@ -245,7 +280,7 @@ struct Ledger {
 
     /// Real personal spend with a known SGD value and a date - what every chart is made of.
     var counted: [ItemView] {
-        items.filter { !$0.isDeposit && $0.personalSGD != nil && $0.date != nil }
+        items.filter { $0.personalSGD != nil && $0.date != nil }
     }
 
     func category(named name: String) -> Category? { categories.first { $0.name == name && $0.kind != .misc } }

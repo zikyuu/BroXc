@@ -31,6 +31,7 @@ enum CategoryKind: String, Codable {
     case normal
     case misc       // a deliberate "doesn't fit elsewhere" bucket
     case grocery    // the unitemised bucket for receipt-less supermarket charges
+    case deposit    // bottle deposit (pant): paid at the till, credited back when bottles are returned
 }
 
 /// Where a YouTrip charge's SGD conversion came from, when showing a receipt's items in SGD.

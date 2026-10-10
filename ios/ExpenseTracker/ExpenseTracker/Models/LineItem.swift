@@ -24,7 +24,10 @@ final class LineItem {
     var uid: String = UUID().uuidString
     /// Order within its receipt (relationship arrays have no inherent order).
     var position: Int = 0
+    /// What the item is called to the user: the English translation when there is one.
     var name: String = ""
+    /// The text as printed on the receipt, in its own language. Evidence - kept even when `name` is a translation.
+    var originalName: String?
     var price: Double = 0
     var quantity: Double? = 1.0
     var translatedText: String?
@@ -34,6 +37,9 @@ final class LineItem {
     /// Sweden/Germany/Finland bottle pant/Pfand/pantti deposit refund — its own line, never merged
     /// as a discount even when negative, and always excluded from spending totals.
     var isDeposit: Bool = false
+    /// For a bottle deposit paid with a drink: the `uid` of that drink. The deposit is a sub-item of it and follows
+    /// its category. nil for a standalone deposit and for returned-bottle credits.
+    var parentUID: String?
     /// Per-item flat labels, e.g. ["food", "meats"] — "mystery" means this one line is unreadable.
     /// Kept alongside the category tree as an older, looser way to tag something; the tree is what
     /// actually drives spending breakdowns now.
