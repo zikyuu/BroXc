@@ -90,6 +90,45 @@ final class ReceiptParserTests: XCTestCase {
         XCTAssertEqual(draft.items[0].price, 30.00, accuracy: 0.001)
     }
 
+    func testStackedLogoIsJoinedForTheOriginalMerchant() {
+        XCTAssertEqual(ReceiptParser.originalMerchant(ocr([("Stora", 1), ("COOP", 0.5), ("Uppsala, Boländerna", 1)])), "Stora COOP")
+        XCTAssertEqual(ReceiptParser.originalMerchant(ocr([("Pressbyran", 1), ("Kvitto: 12345", 1)])), "Pressbyran", "a long single-row name is left alone")
+        XCTAssertEqual(ReceiptParser.originalMerchant(ocr([("ICA", 1), ("Maxi Stormarknad Uppsala", 1)])), "ICA", "a long second row isn't part of the logo")
+    }
+
+    func testSwedishKeywordsAndDecimalCommas() {
+        let draft = ReceiptParser.parse(ocr([("Stora", 1), ("Datum: 2026-08-21", 1), ("Mjölk 15,90", 0.9), ("Pant 2,00", 0.9), ("RABATTER", 1),
+                                              ("Kaffe 40,00 -5,00", 0.9), ("SUMMERING RABATTER DETTA KÖP 5,00", 0.9), ("ATT BETALA ( 3 ARTIKLAR ) 52,90", 0.9),
+                                              ("Moms 12,00", 0.9), ("KORTKÖP 52,90", 0.9)]))
+        XCTAssertEqual(draft.total, 52.90)
+        XCTAssertEqual(draft.tax, 12.00)
+        XCTAssertEqual(draft.items.first?.name, "Mjölk")
+        XCTAssertTrue(draft.items.contains { $0.isDeposit && $0.price == 2.0 })
+        XCTAssertFalse(draft.items.contains { $0.name.lowercased().contains("summering") })
+    }
+
+    func testNameAndPriceSplitAcrossRowsAreJoined() {
+        let rows: [(text: String, confidence: Double)] = [("GODIS LOSVIKt°5", 1), ("30,74", 0.8), ("Datum:", 1), ("2026-08-21 17:08", 1), ("MAX WHITE 33,95", 1)]
+        let merged = ReceiptParser.mergeSplitRows(rows)
+        XCTAssertEqual(merged.map(\.text), ["GODIS LOSVIKt°5 30,74", "Datum:", "2026-08-21 17:08", "MAX WHITE 33,95"])
+        XCTAssertEqual(merged[0].confidence, 0.8, "only as confident as the weaker row")
+        let draft = ReceiptParser.parse(ocr([("COOP", 1), ("HARSNODD SAMX 103, 16 SEK/Kg", 1), ("29,90", 1), ("ATT BETALA 29,90", 1)]))
+        XCTAssertEqual(draft.items.map(\.name), ["HARSNODD SAMX"])
+        XCTAssertEqual(draft.items.first?.price, 29.90)
+    }
+
+    func testTranslationKeepsThePrintedNameAlongside() {
+        var draft = ReceiptDraft()
+        draft.items = [ParsedLineItem(name: "ANSIKTSSERVETTER", price: 41.9), ParsedLineItem(name: "?????", price: 12, tags: ["mystery"]), ParsedLineItem(name: "MJÖLK", price: 15.9)]
+        XCTAssertEqual(ReceiptTranslation.texts(draft), ["Ansiktsservetter", "?????", "Mjölk"], "capitals are softened so the translator reads words, not abbreviations")
+        let done = ReceiptTranslation.apply(["Facial tissues", "ignored", "Milk"], to: draft)
+        XCTAssertEqual(done.items.map(\.name), ["Facial tissues", "?????", "Milk"], "an unreadable line is left alone")
+        XCTAssertEqual(done.items.map(\.originalName), ["ANSIKTSSERVETTER", nil, "MJÖLK"])
+        // no translator, or a failed one, changes nothing
+        XCTAssertEqual(ReceiptTranslation.apply(nil, to: draft).items.map(\.name), ["ANSIKTSSERVETTER", "?????", "MJÖLK"])
+        XCTAssertEqual(ReceiptTranslation.apply(["only one"], to: draft).items.map(\.name), ["ANSIKTSSERVETTER", "?????", "MJÖLK"], "a wrong-length answer is ignored, not misaligned")
+    }
+
     func testUnreadableLinesAreTaggedMystery() {
         let draft = ReceiptParser.parse(ocr([("COOP", 0.9), ("?????? 12.00", 0.2), ("TOTAL 12.00", 0.9)]))
         XCTAssertEqual(draft.items.first?.tags, ["mystery"])
@@ -143,5 +182,136 @@ final class MatcherTests: LedgerTestCase {
         XCTAssertTrue(mine!.note?.contains("off the usual") ?? false)
         XCTAssertEqual(t.matchedReceipt?.persistentModelID, receipt.persistentModelID)
         XCTAssertEqual(t.matchStatus, "needs_review")
+    }
+
+    /// The reported failure: a 395 kr grocery receipt got linked to a $300 top-up on the same day, which then
+    /// made every item price on the receipt wrong.
+    func testAReceiptNeverLinksToAnUnrelatedChargeJustBecauseOfTheDate() {
+        for (i, pair) in [(500.0, 66.0), (300.0, 40.0), (150.0, 20.0)].enumerated() {
+            addTxn("2026-10-0\(i + 1)", "SHOP \(i)", pair.1, local: pair.0, currency: "SEK")   // gives SEK a usual rate of about 7.5
+        }
+        let receipt = addReceipt("ICA Supermarket", "2026-10-09", currency: "SEK", [("groceries", 395.39, [])])
+        let topUp = addTxn("2026-10-09", "Top up", 300)
+        XCTAssertTrue(Matcher.run(in: context).isEmpty, "same day is not evidence")
+        XCTAssertNil(topUp.matchedReceipt)
+        // and the right charge (about 52 SGD for 395 kr) is accepted, name or no name
+        let real = addTxn("2026-10-09", "ICA SUPERMARKET KISTA", 52.5, local: 395.39, currency: "SEK")
+        XCTAssertEqual(Matcher.run(in: context).count, 1)
+        XCTAssertEqual(real.matchedReceipt?.persistentModelID, receipt.persistentModelID)
+    }
+
+    func testAChargeWithNoLocalAmountIsNeverGuessedAtForAForeignReceipt() {
+        for (i, pair) in [(500.0, 66.0), (300.0, 40.0), (150.0, 20.0)].enumerated() { addTxn("2026-10-0\(i + 1)", "SHOP \(i)", pair.1, local: pair.0, currency: "SEK") }
+        addReceipt("Some shop", "2026-10-09", currency: "SEK", [("x", 395.39, [])])
+        let looksRight = addTxn("2026-10-09", "XYZ", 52.5)   // about right at the usual rate, but nothing proves it
+        XCTAssertTrue(Matcher.run(in: context).isEmpty, "no rough conversion: it can only be linked by hand")
+        XCTAssertNil(looksRight.matchedReceipt)
+    }
+
+    /// $5.97 and $5.95 are different purchases - there is no "close enough" when YouTrip shows the exact amount.
+    func testReceiptTotalMustEqualTheChargeNotJustComeCloseToIt() {
+        let receipt = addReceipt("Kiosk", "2026-10-09", currency: "SGD", [("snack", 5.97, [])])
+        let nearMiss = addTxn("2026-10-09", "KIOSK", 5.95)
+        XCTAssertTrue(Matcher.run(in: context).isEmpty)
+        XCTAssertNil(nearMiss.matchedReceipt)
+        let exact = addTxn("2026-10-09", "KIOSK", 5.97)
+        XCTAssertEqual(Matcher.run(in: context).count, 1)
+        XCTAssertEqual(exact.matchedReceipt?.persistentModelID, receipt.persistentModelID)
+    }
+
+    func testOneCentOfRoundingIsAllowedButNoMore() {
+        addReceipt("ICA", "2026-10-09", currency: "SEK", [("a", 395.39, [])])
+        let tooFar = addTxn("2026-10-09", "ICA", 52, local: 395.41, currency: "SEK")
+        XCTAssertTrue(Matcher.run(in: context).isEmpty)
+        XCTAssertNil(tooFar.matchedReceipt)
+        let oneCent = addTxn("2026-10-09", "ICA", 52, local: 395.40, currency: "SEK")
+        XCTAssertEqual(Matcher.run(in: context).count, 1)
+        XCTAssertNotNil(oneCent.matchedReceipt)
+    }
+
+    func testTheCurrencyHasToMatchToo() {
+        addReceipt("Cafe", "2026-10-09", currency: "EUR", [("a", 50, [])])
+        let sek = addTxn("2026-10-09", "CAFE", 6.5, local: 50, currency: "SEK")
+        XCTAssertTrue(Matcher.run(in: context).isEmpty, "50 EUR is not 50 SEK")
+        XCTAssertNil(sek.matchedReceipt)
+    }
+
+    func testEqualAmountsAreToldApartByNameAndFlaggedForReview() {
+        let ica = addReceipt("ICA Supermarket", "2026-10-09", currency: "SEK", [("a", 100, [])])
+        let coop = addReceipt("Coop", "2026-10-09", currency: "SEK", [("b", 100, [])])
+        let tIca = addTxn("2026-10-09", "ICA SUPERMARKET KISTA", 13, local: 100, currency: "SEK")
+        let tCoop = addTxn("2026-10-09", "COOP UPPSALA", 13, local: 100, currency: "SEK")
+        XCTAssertEqual(Matcher.run(in: context).count, 2)
+        XCTAssertEqual(tIca.matchedReceipt?.persistentModelID, ica.persistentModelID)
+        XCTAssertEqual(tCoop.matchedReceipt?.persistentModelID, coop.persistentModelID)
+        XCTAssertEqual(tIca.matchStatus, "needs_review", "an exact amount that isn't unique is worth a glance")
+    }
+
+    func testSameAmountDaysApartNeedsTheNameToAgree() {
+        addReceipt("ICA Supermarket", "2026-10-01", currency: "SEK", [("a", 100, [])])
+        let stranger = addTxn("2026-10-09", "SYSTEMBOLAGET", 13, local: 100, currency: "SEK")
+        XCTAssertTrue(Matcher.run(in: context).isEmpty)
+        XCTAssertNil(stranger.matchedReceipt)
+        let same = addTxn("2026-10-09", "ICA SUPERMARKET KISTA", 13, local: 100, currency: "SEK")
+        let results = Matcher.run(in: context)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertNotNil(same.matchedReceipt)
+        XCTAssertTrue(results.first?.needsReview ?? false, "8 days apart gets a review flag even with the name agreeing")
+    }
+
+    func testAnAbsurdLinkedRateFallsBackToTheUsualRate() throws {
+        for (i, pair) in [(500.0, 66.0), (300.0, 40.0), (150.0, 20.0)].enumerated() { addTxn("2026-10-0\(i + 1)", "SHOP \(i)", pair.1, local: pair.0, currency: "SEK") }
+        let receipt = addReceipt("ICA", "2026-10-09", currency: "SEK", [("bacon", 16, [])])
+        receipt.total = 395.39
+        let wrong = addTxn("2026-10-09", "Top up", 300)
+        Actions.link(wrong, to: receipt, in: context)   // a human (or a bug) forced a bad link
+        let item = ledger().items.first { $0.name == "bacon" }!
+        XCTAssertEqual(item.sgdSource, .estimated, "a rate 5x off the usual one isn't trusted")
+        XCTAssertEqual(item.priceSGD ?? 0, 16 / 7.5, accuracy: 0.2, "16 kr is about 2 SGD, not 12")
+    }
+
+    func testTopUpsAndRefundsAreNotPurchases() {
+        XCTAssertEqual(YouTripParser.suggestedType(for: "Top up"), .transferOwnAccount)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "TOP-UP via bank transfer"), .transferOwnAccount)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "Refund ICA MAXI"), .refund)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "Cashback"), .income)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "ICA SUPERMARKET KISTA"), .expense)
+        XCTAssertEqual(YouTripParser.suggestedType(for: nil), .expense)
+        let parsed = YouTripParser.parse(rows: ["09 Oct 2026", "Top up", "300.00 SGD", "ICA KISTA kr395.39 SEK", "52.50 SGD"])
+        XCTAssertEqual(parsed.map(\.transactionType), [.transferOwnAccount, .expense])
+        let saved = Actions.saveNew(parsed, in: context)
+        XCTAssertEqual(saved.added, 2)
+        XCTAssertEqual(ledger().categoryTree().totalSGD, 52.5, "the top-up isn't spending")
+    }
+
+    func testGreenPlusRowsAreMoneyIn() {
+        let rows = ["09 Oct 2026", "Allowance", "+300.00 SGD", "From Mum", "+ $50.00 SGD", "ICA KISTA kr395.39 SEK", "52.50 SGD", "Refund ICA", "+S$12.00 SGD"]
+        let parsed = YouTripParser.parse(rows: rows)
+        XCTAssertEqual(parsed.map(\.transactionType), [.other, .other, .expense, .refund])
+        XCTAssertEqual(parsed.map { $0.amountSGD ?? 0 }, [300, 50, 52.5, 12])
+        XCTAssertEqual(parsed[0].description, "Allowance", "the plus sign isn't left in the description")
+        XCTAssertEqual(YouTripParser.parse(rows: ["Top up", "+100.00 SGD"]).first?.transactionType, .transferOwnAccount, "wording still wins when there is any")
+    }
+
+    func testMoneyInCanBeFiledUnderACustomCategory() throws {
+        let t = addTxn("2026-10-09", "From Mum", 300, type: .other)
+        XCTAssertEqual(Actions.addMoneyInLabel(" Allowance ", in: context), "Allowance")
+        XCTAssertEqual(Actions.addMoneyInLabel("allowance", in: context), "Allowance", "no duplicates")
+        try Actions.classify(t, as: .income, label: "Allowance", in: context)
+        XCTAssertEqual(t.transactionType, .income)
+        XCTAssertEqual(t.incomeLabel, "Allowance")
+        try Actions.classify(t, as: .transferOwnAccount, in: context)
+        XCTAssertNil(t.incomeLabel, "the label goes when it's no longer income")
+    }
+
+    /// The reported bug: the phone's clock and YouTrip's search box got glued onto the first charge's name.
+    func testScreenFurnitureIsNotPartOfAMerchantName() {
+        let rows = ["2:58", "Search merchant, date or amount", "09 Oct 2026", "ICA SUPERMARKET KISTA kr395.39 SEK", "50.85 SGD",
+                    "2:588 Search merchant, date or amount", "HMSHost Arlanda kr100.00 SEK", "13.00 SGD"]
+        let parsed = YouTripParser.parse(rows: rows)
+        XCTAssertEqual(parsed.map(\.description), ["ICA SUPERMARKET KISTA", "HMSHost Arlanda"])
+        // and with no date header at all, the search box still never leaks in
+        let noHeader = YouTripParser.parse(rows: ["Search merchant, date or amount", "SL ACCESS kr300.00 SEK", "39.90 SGD"])
+        XCTAssertEqual(noHeader.first?.description, "SL ACCESS")
     }
 }

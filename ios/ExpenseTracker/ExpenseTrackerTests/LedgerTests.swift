@@ -7,7 +7,8 @@ final class LedgerTests: LedgerTestCase {
     func testSeededTree() {
         let meat = category("Meat")
         XCTAssertEqual(meat.path, ["Food", "Cooking Ingredients", "Meat"])
-        XCTAssertEqual(meat.effectiveColorHex, category("Food").colorHex)
+        XCTAssertNotEqual(meat.effectiveColorHex, category("Vegetables").effectiveColorHex, "sub-categories have their own colours")
+        XCTAssertEqual(category("Accommodation").effectiveColorHex, category("Accommodation").colorHex, "a top-level category uses its own colour")
         XCTAssertEqual(category("Chicken").depth, 3)
     }
 
@@ -202,5 +203,108 @@ final class LedgerTests: LedgerTestCase {
         XCTAssertEqual(Actions.deleteCategory(category("Pork"), in: context), 1)
         XCTAssertEqual(receipt.lineItems[0].category?.name, "Meat")
         XCTAssertThrowsError(try Actions.createCategory(name: "chicken", parent: category("Meat"), icon: nil, colorHex: nil, in: context))
+    }
+
+    /// A shop's history is about the shop: a one-off ICA charge must not inherit "Meat" and look like a decision the user made.
+    func testReceiptlessChargeGuessIsBroadAndMarkedAsAGuess() {
+        let meat = category("Meat")
+        let receipt = addReceipt("ICA Supermarket", "2026-10-09", currency: "SGD", [("Bacon", 3, []), ("Ham", 4, [])])
+        for item in receipt.lineItems { item.category = meat }
+        try? context.save()
+        addTxn("2026-10-08", "ICA SUPERMARKET VAST, UPPSALA", 2.85)
+        let drink = ledger().items.first { $0.isVirtual }!
+        XCTAssertEqual(drink.confidence, .suggested, "never presented as the user's own choice")
+        XCTAssertEqual(drink.category?.kind, .grocery, "broadened to the grocery bucket, not Meat")
+        XCTAssertNotNil(drink.suggestionNote)
+    }
+
+    /// Pant counts as spending under its own category, and returned bottles come back as a credit.
+    func testBottleDepositCountsAsSpendingAndReturnsReduceIt() {
+        CategorySeeder.seedIfNeeded(in: context)
+        let receipt = addReceipt("ICA", "2026-10-09", currency: "SGD", [("Juice", 3, []), ("Pant", 1, []), ("Pant retur", -0.4, [])])
+        for item in receipt.lineItems where item.name.hasPrefix("Pant") { item.isDeposit = true }
+        try? context.save()
+        let l = ledger()
+        XCTAssertEqual(l.categoryTree().totalSGD, 3.6, accuracy: 0.001, "3 + 1 pant - 0.40 returned")
+        let pant = Ledger.pantSummary(l.items)
+        XCTAssertEqual(pant.paid, 1, accuracy: 0.001)
+        XCTAssertEqual(pant.returned, 0.4, accuracy: 0.001)
+        XCTAssertEqual(pant.net, 0.6, accuracy: 0.001)
+        XCTAssertEqual(l.items.first { $0.isDeposit }?.category?.kind, .deposit)
+    }
+
+    /// The reported complaint: moving the drink must take its pant with it.
+    func testDepositFollowsItsDrink() {
+        CategorySeeder.seedIfNeeded(in: context)
+        let draft = ReceiptDraft(merchant: "ICA", merchantOriginal: nil, date: day("2026-10-09"), currency: "SGD", total: 4.6, tax: nil,
+                                 items: [ParsedLineItem(name: "Pepsi Max", price: 2.5), ParsedLineItem(name: "Pant", price: 0.5, isDeposit: true),
+                                         ParsedLineItem(name: "Bread", price: 2), ParsedLineItem(name: "Pant retur", price: -0.4, isDeposit: true)],
+                                 suggestedCategory: nil, ocrConfidence: 1, rawText: "x", sourceImagePath: nil)
+        Actions.save(draft, in: context)
+        let before = ledger()
+        let pepsi = before.items.first { $0.name == "Pepsi Max" }!
+        let pant = before.items.first { $0.name == "Pant" }!
+        XCTAssertEqual(pant.parentID, pepsi.id)
+        XCTAssertNil(before.items.first { $0.name == "Pant retur" }?.parentID, "a returned-bottle credit isn't tied to any drink")
+        Actions.assignCategory([pepsi], to: category("Drinks"), ledger: before, in: context)
+        let after = ledger()
+        XCTAssertEqual(after.items.first { $0.name == "Pant" }?.category?.name, "Drinks")
+        XCTAssertEqual(after.items.first { $0.name == "Pant retur" }?.category?.kind, .deposit)
+    }
+
+    /// Teaching the app what "Äpple" is must work next time even if the translation comes out differently.
+    func testRememberedCategoryMatchesOnThePrintedNameNotTheTranslation() {
+        CategorySeeder.seedIfNeeded(in: context)
+        let first = addReceipt("ICA Supermarket", "2026-10-09", currency: "SGD", [("Apple R Gala", 2.5, [])])
+        first.lineItems[0].originalName = "Apple R Gala ICA"
+        try? context.save()
+        let apple = ledger().items.first { $0.name == "Apple R Gala" }!
+        Actions.assignCategory([apple], to: category("Fruit"), remember: true, ledger: ledger(), in: context)
+        let second = addReceipt("ICA Supermarket", "2026-10-16", currency: "SGD", [("Gala apple", 2.6, [])])
+        second.lineItems[0].originalName = "Apple R Gala ICA"
+        try? context.save()
+        let next = ledger().items.first { $0.name == "Gala apple" }!
+        XCTAssertEqual(next.category?.name, "Fruit")
+        XCTAssertEqual(next.confidence, .suggested, "a remembered choice is offered, never silently confirmed")
+    }
+
+    /// Vegetables green, meat red, fruit yellow - inside the same Food category - and a new sub-category gets a free colour.
+    func testSubCategoriesHaveTheirOwnColours() throws {
+        CategorySeeder.seedIfNeeded(in: context)
+        let veg = category("Vegetables"), meat = category("Meat"), fruit = category("Fruit"), food = category("Food")
+        XCTAssertEqual(Set([veg, meat, fruit].map(\.effectiveColorHex)).count, 3, "siblings are told apart")
+        XCTAssertNotEqual(veg.effectiveColorHex, food.effectiveColorHex)
+        let chicken = category("Chicken")
+        chicken.colorHex = nil
+        XCTAssertEqual(chicken.effectiveColorHex, meat.effectiveColorHex, "no colour of its own: reads as its parent")
+        let made = try Actions.createCategory(name: "Herbs", parent: veg, icon: nil, colorHex: nil, in: context)
+        let other = try Actions.createCategory(name: "Sprouts", parent: veg, icon: nil, colorHex: nil, in: context)
+        XCTAssertNotNil(made.colorHex)
+        XCTAssertNotEqual(made.colorHex, other.colorHex)
+    }
+
+    /// Renaming "Romantica RosaBand" once names it everywhere: past receipts, and the next one that prints it.
+    func testRenamingIsRememberedForTheSamePrintedText() throws {
+        let first = addReceipt("ICA", "2026-10-09", currency: "SGD", [("Romantica RosaBand", 6.4, [])])
+        let past = addReceipt("ICA", "2026-10-02", currency: "SGD", [("Romantica RosaBand", 6.1, [])])
+        let tomato = ledger().items.first { $0.receipt === first }!
+        try Actions.rename(tomato, to: "Cherry tomatoes", remember: true, in: context)
+        XCTAssertEqual(first.lineItems[0].name, "Cherry tomatoes")
+        XCTAssertEqual(first.lineItems[0].originalName, "Romantica RosaBand", "what was printed is kept")
+        XCTAssertEqual(past.lineItems[0].name, "Cherry tomatoes", "past items with the same printed text follow")
+        let draft = ReceiptDraft(merchant: "ICA", merchantOriginal: nil, date: day("2026-10-16"), currency: "SGD", total: 6.2, tax: nil,
+                                 items: [ParsedLineItem(name: "Romantica RosaBand", price: 6.2)], suggestedCategory: nil,
+                                 ocrConfidence: 1, rawText: "x", sourceImagePath: nil)
+        let next = Actions.save(draft, in: context)
+        XCTAssertEqual(next.lineItems[0].name, "Cherry tomatoes", "applied automatically on the next receipt")
+        XCTAssertThrowsError(try Actions.rename(tomato, to: "  ", remember: false, in: context))
+    }
+
+    func testRenamingWithoutRememberTouchesOnlyThatItem() throws {
+        let a = addReceipt("ICA", "2026-10-09", currency: "SGD", [("Mystery thing", 3, [])])
+        let b = addReceipt("ICA", "2026-10-10", currency: "SGD", [("Mystery thing", 3, [])])
+        try Actions.rename(ledger().items.first { $0.receipt === a }!, to: "Oat drink", remember: false, in: context)
+        XCTAssertEqual(a.lineItems[0].name, "Oat drink")
+        XCTAssertEqual(b.lineItems[0].name, "Mystery thing")
     }
 }
