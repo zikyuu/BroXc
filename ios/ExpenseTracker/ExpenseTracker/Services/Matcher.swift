@@ -1,26 +1,24 @@
 import Foundation
 import SwiftData
 
-/// Links parsed receipts to YouTrip charges. Cost = date proximity + how closely the receipt total equals
-/// what YouTrip charged in the same currency + fuzzy merchant-name similarity - deterministic and fully
-/// explainable. A link the matcher isn't sure about (weak cost, or an exchange rate far from the usual one)
-/// is still made, but flagged needs_review so the user can approve or undo it. Nothing waits on the user.
+/// Links parsed receipts to YouTrip charges. The rule is exact: YouTrip shows the amount the merchant actually
+/// charged in its own currency (395.39 kr), so a receipt can only belong to a charge whose local amount equals
+/// the receipt total to the cent (0.01 for rounding) - no exchange rate, no "close enough". A charge with no
+/// local amount can only be matched to a receipt in SGD, otherwise it's left for a manual link.
+/// Among the charges that DO agree on amount, date proximity and the fuzzy merchant name pick the pairing, and
+/// anything not clear-cut (several candidates with the same amount, dates apart, odd exchange rate) is linked
+/// but flagged needs_review. Nothing waits on the user.
 enum Matcher {
-    static let dateWeight = 1.0
-    static let amountWeight = 1.0
-    static let nameWeight = 1.0
-    /// A pair costing more than this is rejected rather than forced together - the assignment algorithm
-    /// always pairs every receipt it can, however absurd, so without this a receipt whose charge hasn't
-    /// been uploaded yet would be force-fitted to the wrong one.
-    static let maxAcceptableCost = 3.0
-    /// At or below this a link is trusted; between this and the max it's linked but flagged for review.
-    static let confidentCost = 1.0
-    /// An instant-processing card: even a 1-day gap is unusual (1, not 0, only for midnight/timezone quirks).
-    static let dateCostScaleDays = 1.0
-    /// A 5% gap between receipt total and YouTrip's charge costs 1.0 (capped at 2.0).
-    static let amountGapScale = 20.0
+    /// Largest amount difference still treated as equal (a rounding cent).
+    static let amountTolerance = 0.0101
+    /// Beyond this many days apart the merchant names must also agree, or the pair is rejected.
+    static let maxDaysWithoutName = 2
+    /// A name this similar (0...1) counts as "the same merchant".
+    static let sameMerchantSimilarity = 0.7
     /// Flag a link whose exchange rate is more than 10% off that currency's usual rate.
     static let fxReviewTolerance = 0.10
+    /// Cost of a pair that is not allowed; high enough that the assignment never prefers it.
+    private static let forbidden = 1000.0
 
     struct Result {
         let receipt: Receipt
@@ -32,25 +30,30 @@ enum Matcher {
 
     static func dateCost(_ receipt: Date?, _ transaction: Date?) -> Double {
         guard let receipt, let transaction else { return 1 }
-        return min(Double(Dates.daysApart(receipt, transaction)) / dateCostScaleDays, 2)
+        return min(Double(Dates.daysApart(receipt, transaction)), 2)
     }
 
-    private static func gapCost(_ a: Double, _ b: Double?) -> Double {
-        guard let b, b != 0 else { return 1 }
-        return min(abs(a - b) / b * amountGapScale, 2)
-    }
-
-    /// 0 = the receipt total equals what YouTrip says the merchant charged, in the same currency. The
-    /// strongest signal there is: it needs no exchange rate and no readable store name.
-    static func amountCost(_ receipt: Receipt, _ t: YouTripTransaction) -> Double {
-        guard let total = receipt.total, total != 0 else { return 1 }   // nothing to compare - neutral, not a penalty
+    /// True only when the receipt total equals the amount YouTrip charged, in the same currency.
+    static func amountsAgree(_ receipt: Receipt, _ t: YouTripTransaction) -> Bool {
+        guard let total = receipt.total, total != 0 else { return false }
         let currency = (receipt.currency ?? "").uppercased()
         if let local = t.localAmount, local != 0, let localCurrency = t.localCurrency {
-            if !currency.isEmpty && currency != localCurrency.uppercased() { return 2 }
-            return gapCost(total, local)
+            guard currency.isEmpty || currency == localCurrency.uppercased() else { return false }
+            return abs(total - local) <= amountTolerance
         }
-        if currency == "SGD", let sgd = t.amountSGD, sgd != 0 { return gapCost(total, sgd) }
-        return 1
+        // no local amount shown: the card was charged in SGD, so only an SGD receipt can be compared exactly
+        if currency == "SGD", let sgd = t.amountSGD, sgd != 0 { return abs(total - sgd) <= amountTolerance }
+        return false
+    }
+
+    /// nil when the pair isn't allowed. Otherwise date proximity + name difference (the amount already agrees).
+    static func pairCost(_ receipt: Receipt, _ t: YouTripTransaction) -> Double? {
+        guard amountsAgree(receipt, t) else { return nil }
+        let name = nameCost(receipt, t.transactionDescription)
+        if let r = receipt.date, let d = t.date, Dates.daysApart(r, d) > maxDaysWithoutName, 1 - name < sameMerchantSimilarity {
+            return nil   // same amount but days apart and a different-looking merchant: a coincidence, not a match
+        }
+        return dateCost(receipt.date, t.date) + name
     }
 
     /// Best of the translated and original-language merchant names - either matching well is enough.
@@ -73,20 +76,24 @@ enum Matcher {
 
     static func match(receipts: [Receipt], transactions: [YouTripTransaction], reference: [String: Double]) -> [Result] {
         guard !receipts.isEmpty, !transactions.isEmpty else { return [] }
-        let costs = receipts.map { r in
-            transactions.map { t in
-                dateWeight * dateCost(r.date, t.date) + amountWeight * amountCost(r, t) + nameWeight * nameCost(r, t.transactionDescription)
-            }
-        }
+        let costs = receipts.map { r in transactions.map { t in pairCost(r, t) ?? forbidden } }
         var results: [Result] = []
         for pair in Hungarian.solve(costs) {
             let cost = costs[pair.row][pair.column]
-            if cost > maxAcceptableCost { continue }
-            let t = transactions[pair.column]
+            if cost >= forbidden { continue }
+            let r = receipts[pair.row], t = transactions[pair.column]
             var notes: [String] = []
             if let fx = fxNote(t, reference: reference) { notes.append(fx) }
-            if cost > confidentCost { notes.append(String(format: "weak match (cost %.1f)", cost)) }
-            results.append(Result(receipt: receipts[pair.row], transaction: t, cost: cost,
+            if let rd = r.date, let td = t.date {
+                let gap = Dates.daysApart(rd, td)
+                if gap > 1 { notes.append("receipt and charge are \(gap) days apart") }
+            } else {
+                notes.append("no date to compare")
+            }
+            let rivalCharges = costs[pair.row].filter { $0 < forbidden }.count
+            let rivalReceipts = costs.filter { $0[pair.column] < forbidden }.count
+            if rivalCharges > 1 || rivalReceipts > 1 { notes.append("other receipts or charges have this exact amount too") }
+            results.append(Result(receipt: r, transaction: t, cost: cost,
                                   needsReview: !notes.isEmpty, note: notes.isEmpty ? nil : notes.joined(separator: "; ")))
         }
         return results
