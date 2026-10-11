@@ -1,8 +1,9 @@
 import SwiftUI
 import SwiftData
 
-/// The category drill-down (Food -> Cooking Ingredients -> Meat -> Chicken): semi-proportional tiles for the
-/// children, then the transactions underneath. Tiles are drop targets - long-press an item and drag it onto one.
+/// The category drill-down (Food -> Cooking Ingredients -> Meat -> Chicken): a donut of the children with this category in
+/// the middle, then a card per child holding its own transactions. Cards are drop targets - hold a transaction and drag it
+/// from one card onto another.
 struct CategoryView: View {
     let target: CategoryTarget
     @Environment(\.modelContext) private var context
@@ -61,8 +62,12 @@ struct CategoryView: View {
             let items = scopeItems(ledger).filter { ($0.isDeposit || ($0.personalSGD ?? 1) > 0) && belongs($0) }
                 .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
             let share = tree.totalSGD > 0 ? node.totalSGD / tree.totalSGD * 100 : 0
+            let tiles = node.children.filter { !($0.totalSGD <= 0 && ($0.kind == .misc || $0.isUnsorted)) }
+            let showBoard = !tiles.isEmpty && !(tab == .transactions && !node.isUnsorted)
             Screen {
-                hero(node, share: share)
+                if showBoard {
+                    CategoryDonut(node: node, tiles: tiles, scope: target.scope, scopeLabel: scopeLabel, share: share)
+                } else { hero(node, share: share) }
                 if node.kind == .deposit {
                     // every deposit in this period, including the ones that sit with their drink in another category
                     let deposits = scopeItems(ledger).filter(\.isDeposit)
@@ -110,11 +115,12 @@ struct CategoryView: View {
         }
     }
 
+    private var scopeLabel: String {
+        switch target.scope { case .month(let m): m.label; case .trip(let t): t.name }
+    }
+
     private func hero(_ node: CategoryNode, share: Double) -> some View {
         let color = Color(hex: node.colorHex)
-        let scopeLabel: String = {
-            switch target.scope { case .month(let m): m.label; case .trip(let t): t.name }
-        }()
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 14) {
                 IconTile(symbol: node.icon, color: color, size: 52)
@@ -138,18 +144,20 @@ struct CategoryView: View {
     @ViewBuilder
     private func breakdown(_ node: CategoryNode, _ items: [ItemView], _ ledger: Ledger) -> some View {
         let tiles = node.children.filter { !($0.totalSGD <= 0 && ($0.kind == .misc || $0.isUnsorted)) }
-        if tiles.isEmpty {
+        if !tiles.isEmpty {
+            // the picture: each child as a card holding its own transactions, ready to drag between
+            Text("Hold a transaction and drag it onto another card to move it.").font(.rounded(12)).foregroundStyle(Theme.muted)
+            TileBoard(nodes: tiles, items: items, scope: target.scope, ledger: ledger) { openItemID = $0.id }
+        } else if tiles.isEmpty {
             EmptyCard(node.isUnsorted ? "These items are in the right area, but not placed any deeper yet. Long-press one to move it."
                                        : "This is the lowest level.",
                       node.isUnsorted ? nil : "Add sub-categories from the ⋯ menu if you want to split it further.")
             dropTray(node, ledger)
-        } else {
-            TilesView(nodes: tiles, scope: target.scope, ledger: ledger)
         }
-        SectionTitle(tiles.isEmpty ? "Transactions" : "Recent transactions") {
-            if tiles.isEmpty == false && items.count > 6 { Button("See all") { tab = .transactions }.font(.rounded(13, .semibold)) }
+        if tiles.isEmpty {
+            SectionTitle("Transactions")
+            itemSection(items, ledger, limit: nil)
         }
-        itemSection(items, ledger, limit: tiles.isEmpty ? nil : 6)
     }
 
     /// At the lowest level there are no tiles to drop onto, so offer the parent and siblings as targets.
@@ -253,71 +261,6 @@ struct FlowLayout: Layout {
             view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
             x += size.width + spacing; rowHeight = max(rowHeight, size.height)
         }
-    }
-}
-
-// MARK: - Tiles
-
-struct TilesView: View {
-    let nodes: [CategoryNode]
-    let scope: CategoryTarget.Scope
-    let ledger: Ledger
-
-    var body: some View {
-        let rects = TileLayout.layout(nodes.map(\.totalSGD))
-        let height = min(420, 150 + CGFloat(max(2, (nodes.count + 1) / 2)) * 62)
-        GeometryReader { geo in
-            ZStack(alignment: .topLeading) {
-                ForEach(rects, id: \.index) { r in
-                    let node = nodes[r.index]
-                    Tile(node: node, scope: scope, ledger: ledger)
-                        .frame(width: geo.size.width * r.w, height: geo.size.height * r.h)
-                        .offset(x: geo.size.width * r.x, y: geo.size.height * r.y)
-                }
-            }
-        }
-        .frame(height: height)
-    }
-}
-
-private struct Tile: View {
-    let node: CategoryNode
-    let scope: CategoryTarget.Scope
-    let ledger: Ledger
-    @State private var targeted = false
-
-    private var color: Color {
-        if node.isUnsorted || node.kind == .misc { return Theme.miscColor }
-        if node.kind == .grocery { return Color(hex: "8ab8ff") }
-        if node.category?.parent == nil || node.category?.colorHex != nil { return Color(hex: node.colorHex) }
-        return Theme.stablePastel(node.name)
-    }
-
-    var body: some View {
-        let zero = node.totalSGD <= 0
-        NavigationLink(value: Route.category(CategoryTarget(category: node.category, unsortedOf: node.unsortedOf, scope: scope))) {
-            ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(node.isUnsorted ? Theme.segBg : color.opacity(zero ? 0.12 : 0.32))
-                if node.isUnsorted { RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Theme.mutedLine, style: StrokeStyle(lineWidth: 1.5, dash: [5, 4])) }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(node.name).font(.rounded(14, .bold)).lineLimit(2).minimumScaleFactor(0.8)
-                    Text(Money.whole(node.totalSGD)).font(.rounded(zero ? 15 : 19, .heavy)).foregroundStyle(zero ? Theme.muted : Theme.text)
-                    if node.kind == .grocery { Label("no receipts", systemImage: "doc.text").font(.rounded(11)).foregroundStyle(Theme.muted) }
-                }.padding(10)
-                if let icon = node.category?.icon, node.kind == .normal, !node.isUnsorted {
-                    // only when there's room: in a narrow tile the icon would sit on top of the name
-                    GeometryReader { geo in
-                        if geo.size.width > 130 { Text(icon).font(.system(size: 16)).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(8) }
-                    }
-                }
-            }
-            .overlay { if targeted { RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Theme.accent, lineWidth: 3) } }
-            .padding(3)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .modifier(CategoryDrop(category: node.category ?? node.unsortedOf, ledger: ledger, targeted: $targeted))
     }
 }
 
