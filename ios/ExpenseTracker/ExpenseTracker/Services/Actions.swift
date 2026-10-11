@@ -64,7 +64,7 @@ enum Actions {
             default: return false
             }
         }
-        guard close(row.amountSGD, old.amountSGD), close(row.localAmount, old.localAmount),
+        guard row.account == old.account, close(row.amountSGD, old.amountSGD), close(row.localAmount, old.localAmount),
               (row.localCurrency ?? "").uppercased() == (old.localCurrency ?? "").uppercased() else { return false }
 
         var dateUnknown = false
@@ -97,11 +97,115 @@ enum Actions {
             let t = YouTripTransaction(date: row.date, description: row.description, amountSGD: row.amountSGD,
                                        localAmount: row.localAmount, localCurrency: row.localCurrency,
                                        transactionType: row.transactionType, trip: row.transactionType == .expense ? trip : nil)
+            t.account = row.account
+            t.isOutflow = row.isOutflow
             context.insert(t)
             added += 1
         }
         try? context.save()
         return (added, skipped)
+    }
+
+    // MARK: accounts
+
+    static func accountName(_ account: Account, in context: ModelContext) -> String {
+        ((try? context.fetch(FetchDescriptor<BankAccount>())) ?? []).first { $0.key == account.rawValue }?.name
+            ?? AccountInfo.defaults.first { $0.account == account }?.name ?? account.rawValue
+    }
+
+    /// Which of the user's accounts a screenshot belongs to. YouTrip and PayLah are one each; for DBS the account number
+    /// in the header says which. A number not seen before is either the plain "DBS" account being named for the first time
+    /// or a new account, which is added.
+    static func resolveAccount(kind: ScreenshotKind, hint: (name: String?, number: String?), in context: ModelContext) -> Account {
+        switch kind {
+        case .youtrip: return .youtrip
+        case .paylah: return .paylah
+        case .dbs:
+            guard let number = hint.number else { return .dbs }
+            let all = ((try? context.fetch(FetchDescriptor<BankAccount>(sortBy: [SortDescriptor(\.sortOrder)]))) ?? [])
+            if let known = all.first(where: { $0.number == number }) { return Account(rawValue: known.key) }
+            if let plain = all.first(where: { $0.key == Account.dbs.rawValue && $0.number == nil }) {
+                plain.number = number
+                if let name = hint.name, !name.isEmpty { plain.name = name }
+                try? context.save()
+                return .dbs
+            }
+            let made = BankAccount(name: hint.name ?? "DBS account", kind: .bank, number: number, sortOrder: (all.map(\.sortOrder).max() ?? 0) + 1)
+            context.insert(made)
+            try? context.save()
+            return Account(rawValue: made.key)
+        }
+    }
+
+    /// Drag-to-reorder: puts `key` where `target` is. Dragging down lands it after the target, dragging up lands it before.
+    static func moveAccount(_ key: String, to target: String, in context: ModelContext) {
+        var all = ((try? context.fetch(FetchDescriptor<BankAccount>())) ?? []).sorted { $0.sortOrder < $1.sortOrder }
+        guard key != target, let from = all.firstIndex(where: { $0.key == key }), let to = all.firstIndex(where: { $0.key == target }) else { return }
+        let moved = all.remove(at: from)
+        all.insert(moved, at: to)
+        for (order, account) in all.enumerated() { account.sortOrder = order }
+        try? context.save()
+    }
+
+    private static let transferNumber = Rx(#"^Transfer (?:to|from) (\d{3}-\d{4,6}-\d{1,3})"#)
+
+    /// A transfer to or from an account number is a move between your own accounts only if that number is one of yours.
+    /// Otherwise it's an ordinary payment out or money in.
+    static func settleTransfers(_ rows: [ParsedTransaction], in context: ModelContext) -> [ParsedTransaction] {
+        let mine = Set(((try? context.fetch(FetchDescriptor<BankAccount>())) ?? []).compactMap(\.number))
+        return rows.map { row in
+            guard row.transactionType == .transferOwnAccount, let m = transferNumber.first(in: row.description ?? ""), let number = m.group(1),
+                  !mine.contains(number) else { return row }
+            var r = row
+            r.transactionType = row.isOutflow ? .expense : .other
+            return r
+        }
+    }
+
+    /// Run after importing or after an account's number changes: a transfer that names one of your accounts becomes a move
+    /// between them (and so does the unlabelled money-in on the receiving side), whenever the number became known.
+    static func relinkTransfers(in context: ModelContext) {
+        let accounts = (try? context.fetch(FetchDescriptor<BankAccount>())) ?? []
+        let all = (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []
+        for t in all where t.transactionType == .expense || t.transactionType == .other {
+            guard let m = transferNumber.first(in: t.transactionDescription ?? ""), let number = m.group(1),
+                  accounts.contains(where: { $0.number == number && $0.key != t.sourceRaw }) else { continue }
+            t.transactionType = .transferOwnAccount
+            t.matchedReceipt = nil; t.trip = nil
+        }
+        // the receiving side often shows only "+ amount" with no useful text: if a transfer out says where it went, take the
+        // matching money-in there as the other half
+        for out in all where out.transactionType == .transferOwnAccount && out.isOutflow {
+            guard let m = transferNumber.first(in: out.transactionDescription ?? ""), let number = m.group(1),
+                  let destination = accounts.first(where: { $0.number == number }) else { continue }
+            let candidate = all.first { $0.sourceRaw == destination.key && !$0.isOutflow && $0.transactionType == .other
+                && abs(abs($0.amountSGD ?? -1) - abs(out.amountSGD ?? -2)) < 0.011
+                && ($0.date != nil && out.date != nil ? Dates.daysApart($0.date!, out.date!) <= TransferPairing.windowDays : false) }
+            candidate?.transactionType = .transferOwnAccount
+        }
+        try? context.save()
+    }
+
+    @discardableResult
+    static func addAccount(name: String, kind: AccountKind, number: String?, in context: ModelContext) throws -> BankAccount {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { throw AppError("An account needs a name.") }
+        let all = (try? context.fetch(FetchDescriptor<BankAccount>())) ?? []
+        guard !all.contains(where: { $0.name.lowercased() == trimmed.lowercased() }) else { throw AppError("There’s already an account called “\(trimmed)”.") }
+        let made = BankAccount(name: trimmed, kind: kind, number: number?.trimmingCharacters(in: .whitespaces).nilIfEmpty,
+                               sortOrder: (all.map(\.sortOrder).max() ?? 0) + 1)
+        context.insert(made)
+        try? context.save()
+        return made
+    }
+
+    /// An account that has records can't be deleted (they'd lose their account); an empty one can.
+    static func deleteAccount(_ account: BankAccount, in context: ModelContext) throws {
+        let used = ((try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []).contains { $0.sourceRaw == account.key }
+            || ((try? context.fetch(FetchDescriptor<BalanceReconciliation>())) ?? []).contains { $0.accountRaw == account.key }
+        guard !used else { throw AppError("“\(account.name)” has transactions or balance checks, so it can’t be deleted.") }
+        context.delete(account)
+        try? context.save()
     }
 
     // MARK: matches
@@ -149,6 +253,46 @@ enum Actions {
         context.insert(item)
         t.matchedReceipt = receipt; t.matchStatus = "approved"; t.matchNote = "resolved by editing from the app"
         return item
+    }
+
+    /// Adds a line the reader missed, so the receipt's lines add up to its total again.
+    @discardableResult
+    static func addLine(to receipt: Receipt, name: String, price: Double, in context: ModelContext) throws -> LineItem {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AppError("Give the line a name.") }
+        let item = LineItem(name: trimmed, price: price)
+        item.position = (receipt.lineItems.map(\.position).max() ?? -1) + 1
+        item.receipt = receipt
+        context.insert(item)
+        try? context.save()
+        return item
+    }
+
+    /// Writes the outcome of a re-read into a saved receipt without disturbing anything already there: lines it had are
+    /// kept (their names, categories and splits stay) and only get a corrected price, and new lines are added.
+    @discardableResult
+    static func applyReread(_ entries: [ReceiptMerge.Entry], to receipt: Receipt, in context: ModelContext) -> (added: Int, fixed: Int) {
+        let existing = receipt.lineItems.sorted { $0.position < $1.position }
+        var added = 0, fixed = 0
+        var position = (existing.map(\.position).max() ?? -1) + 1
+        for entry in entries {
+            if let base = entry.base, existing.indices.contains(base) {
+                let line = existing[base]
+                if abs(line.price - entry.item.price) > 0.001 {
+                    line.price = entry.item.price; line.originalPrice = entry.item.originalPrice; line.discount = entry.item.discount; fixed += 1
+                }
+            } else if entry.base == nil {
+                let line = LineItem(name: entry.item.name, price: entry.item.price, quantity: entry.item.quantity,
+                                    originalPrice: entry.item.originalPrice, discount: entry.item.discount, isDeposit: entry.item.isDeposit, tags: entry.item.tags)
+                line.originalName = entry.item.originalName
+                line.position = position; position += 1
+                line.receipt = receipt
+                context.insert(line)
+                added += 1
+            }
+        }
+        try? context.save()
+        return (added, fixed)
     }
 
     static func lineItem(for item: ItemView, in context: ModelContext) -> LineItem {
@@ -406,13 +550,16 @@ enum Actions {
     /// Records the user's real balance. The first is just a baseline; after that, whatever the tracked
     /// transactions can't explain becomes "untracked" - no merchant, date or category invented.
     @discardableResult
-    static func reconcile(actual: Double, on date: Date, ledger: Ledger, in context: ModelContext)
+    static func reconcile(actual: Double, on date: Date, account: Account = .youtrip, ledger: Ledger, in context: ModelContext)
         -> (implied: Double?, gap: Double) {
-        let implied = ledger.currentBalance?.implied
+        // an account with no imported transactions has nothing to compare against: whatever changed since the last
+        // check is simply unexplained, not "untracked spending"
+        let hasRecords = ledger.transactions.contains { $0.account == account }
+        let implied = hasRecords ? ledger.currentBalance(for: account)?.implied : nil
         let gap = implied.map { round2($0 - actual) } ?? 0
-        let known = ledger.transactions.map(\.createdAt).max()
+        let known = ledger.transactions.filter { $0.account == account }.map(\.createdAt).max()
         context.insert(BalanceReconciliation(reconciledOn: date, actualSGD: actual, impliedSGD: implied,
-                                             untrackedSGD: gap, knownThrough: known))
+                                             untrackedSGD: gap, knownThrough: known, account: account))
         try? context.save()
         return (implied, gap)
     }

@@ -57,6 +57,7 @@ struct HomeView: View {
                         .padding(12).background(Theme.greenBg, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }.buttonStyle(.plain)
             }
+            balancesStrip(ledger)
             RadialChart(home: data, wedges: wedges(data)).frame(maxWidth: 420).frame(maxWidth: .infinity)
             legend
             if data.untracked > 0 {
@@ -68,6 +69,33 @@ struct HomeView: View {
                 paceCard(data)
                 needsLookCard(data)
                 comparedCard(data)
+            }
+        }
+    }
+
+    /// Where the money is: one chip per account, with what it holds (or "Set" until you've entered a balance).
+    private func balancesStrip(_ ledger: Ledger) -> some View {
+        let balances = ledger.accounts.map { ($0, ledger.currentBalance(for: $0.account)) }
+        let total = balances.compactMap { $0.1?.implied }.reduce(0, +)
+        return VStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(balances, id: \.0.id) { account, info in
+                        NavigationLink(value: Route.account(account.account)) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(account.icon) \(account.name)").font(.rounded(12, .semibold)).foregroundStyle(Theme.muted).lineLimit(1)
+                                Text(info.map { Money.whole($0.implied) } ?? "Set").font(.rounded(17, .heavy)).foregroundStyle(info == nil ? Theme.accent : Theme.text)
+                            }
+                            .frame(minWidth: 96, alignment: .leading).padding(10)
+                            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay { RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.line) }
+                        }.buttonStyle(.plain)
+                        .reorderableAccount(account.account.rawValue)
+                    }
+                }
+            }
+            if balances.filter({ $0.1 != nil }).count > 1 {
+                Text("\(Money.whole(total)) across your accounts · moving money between them isn’t spending").font(.rounded(11)).foregroundStyle(Theme.muted)
             }
         }
     }

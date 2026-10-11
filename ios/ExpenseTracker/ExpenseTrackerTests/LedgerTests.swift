@@ -307,4 +307,51 @@ final class LedgerTests: LedgerTestCase {
         XCTAssertEqual(a.lineItems[0].name, "Oat drink")
         XCTAssertEqual(b.lineItems[0].name, "Mystery thing")
     }
+
+    /// The reported gap: a receipt whose lines don't add up to its printed total used to look fine - nothing compared them.
+    func testReceiptWhoseLinesDontAddUpIsFlaggedAndCanBeFixed() throws {
+        let receipt = addReceipt("ICA", "2026-10-09", currency: "SEK", [("Bacon", 15.99, []), ("Noodles", 40, [])])
+        XCTAssertNil(receipt.unexplainedAmount, "lines equal the total")
+        receipt.total = 395.39
+        receipt.lineItems.first { $0.name == "Noodles" }!.price = 0.01
+        XCTAssertEqual(receipt.unexplainedAmount ?? 0, 379.39, accuracy: 0.001, "a missed 379.39 kr shows up as the difference")
+        let missing = try Actions.addLine(to: receipt, name: "Missed item", price: 379.39, in: context)
+        XCTAssertNil(receipt.unexplainedAmount, "adding the missing line closes the gap")
+        XCTAssertEqual(missing.position, 2)
+        let typed = addReceipt("Cafe", "2026-10-09", itemised: false, [("coffee", 3, [])])
+        typed.total = 99
+        XCTAssertNil(typed.unexplainedAmount, "a hand-made receipt has nothing to check against")
+    }
+
+    /// DBS, PayLah and YouTrip each keep their own balance; a YouTrip purchase never moves the DBS one.
+    func testEachAccountHasItsOwnBalance() {
+        let first = ledger()
+        Actions.reconcile(actual: 1000, on: day("2026-10-01"), account: .dbs, ledger: first, in: context)
+        Actions.reconcile(actual: 200, on: day("2026-10-01"), account: .youtrip, ledger: first, in: context)
+        addTxn("2026-10-05", "ICA", 30, local: 230, currency: "SEK")
+        let after = ledger()
+        XCTAssertEqual(after.currentBalance(for: .dbs)?.implied, 1000, "spending on YouTrip doesn't touch DBS")
+        XCTAssertEqual(after.currentBalance(for: .youtrip)?.implied ?? 0, 170, accuracy: 0.001)
+        XCTAssertNil(after.currentBalance(for: .paylah), "no balance entered yet")
+        // a second DBS check has no DBS records to compare, so it never invents "untracked spending"
+        let result = Actions.reconcile(actual: 800, on: day("2026-10-08"), account: .dbs, ledger: after, in: context)
+        XCTAssertEqual(result.gap, 0)
+        XCTAssertEqual(ledger().currentBalance(for: .dbs)?.implied, 800)
+        XCTAssertEqual(ledger().untracked(in: MonthKey(day("2026-10-08"))), 0)
+    }
+
+    /// A Tricount settlement paid by PayNow: itemise your share by hand, and the items travel with the trip.
+    func testTricountPaymentCanBeItemisedAndAssignedToATrip() throws {
+        let trip = try Actions.createTrip(name: "Paris", start: day("2026-10-01"), end: day("2026-10-06"), activate: false, colorHex: nil, emoji: nil, in: context)
+        let t = addTxn("2026-10-06", "PayNow to Friend paris tricount", 139.63)
+        t.account = .dbs; t.isOutflow = true
+        try Actions.breakdown(t, parts: [BreakdownPart(category: category("Eat Out"), amount: 90, name: "Dinners"),
+                                         BreakdownPart(category: category("Activities"), amount: 40, name: "Louvre tickets")], in: context)
+        Actions.assign(t, to: trip, in: context)
+        let items = ledger().items(of: t).sorted { $0.price > $1.price }
+        XCTAssertEqual(items.map(\.name), ["Dinners", "Louvre tickets", "Unsorted remainder"])
+        XCTAssertEqual(items.map(\.price).reduce(0, +), 139.63, accuracy: 0.001, "the same money, not extra")
+        XCTAssertTrue(items.allSatisfy { $0.trip?.persistentModelID == trip.persistentModelID }, "every item is in the trip")
+        XCTAssertEqual(ledger().tripSummaries().first { $0.trip === trip }?.spend ?? 0, 139.63, accuracy: 0.01)
+    }
 }

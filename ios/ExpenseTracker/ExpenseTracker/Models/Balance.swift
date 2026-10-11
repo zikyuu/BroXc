@@ -14,9 +14,14 @@ final class BalanceReconciliation {
     /// createdAt of the newest transaction known at the time, so a transaction entered late (even
     /// back-dated) is counted as new movement against the next balance check.
     var knownThrough: Date?
+    /// Which account this check is for. Checks made before there were several are all YouTrip.
+    var accountRaw: String = Account.youtrip.rawValue
+
+    var account: Account { Account(rawValue: accountRaw) }
 
     init(reconciledOn: Date, actualSGD: Double, impliedSGD: Double?, untrackedSGD: Double,
-         knownThrough: Date?) {
+         knownThrough: Date?, account: Account = .youtrip) {
+        self.accountRaw = account.rawValue
         self.reconciledOn = reconciledOn
         self.actualSGD = actualSGD
         self.impliedSGD = impliedSGD

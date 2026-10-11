@@ -26,6 +26,8 @@ struct ReceiptDraft {
     var ocrConfidence: Double?
     var rawText: String?
     var sourceImagePath: String?
+    /// Prices that were unreadable and were worked out from the receipt's total instead (one sentence each).
+    var repairs: [String] = []
 }
 
 /// One row read off a YouTrip transaction-list screenshot.
@@ -37,4 +39,8 @@ struct ParsedTransaction: Equatable {
     var localCurrency: String?
     /// What the description suggests: a top-up or refund is not a purchase. Only a suggestion - the user can change it.
     var transactionType: TransactionType = .expense
+    /// Which account's history this came from.
+    var account: Account = .youtrip
+    /// Money leaving the account. For YouTrip that's every expense; DBS and PayLah say it outright.
+    var isOutflow = false
 }

@@ -5,6 +5,10 @@ import Foundation
 /// Date parsing and month arithmetic. Everything is "start of day, local time": a receipt has a day,
 /// not a moment. Mirrors `shared/dates.py` - ISO is read as-is, anything else day-first, since that's
 /// how the European receipts this app sees write ambiguous dates.
+extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 enum Dates {
     static var calendar: Calendar { Calendar.current }
 

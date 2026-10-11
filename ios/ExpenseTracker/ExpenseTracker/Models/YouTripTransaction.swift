@@ -24,6 +24,14 @@ final class YouTripTransaction {
     var reimbursementAmount: Double?
     /// Which of the user's own money-in categories this is, when it's income ("Allowance", "Scholarship"...).
     var incomeLabel: String?
+    /// Which account this moved money on. Everything imported so far is YouTrip.
+    var sourceRaw: String = Account.youtrip.rawValue
+    /// Money leaving its account. An expense always is; this says it for a transfer out (DBS topping up PayLah).
+    var isOutflow: Bool = false
+    var account: Account {
+        get { Account(rawValue: sourceRaw) }
+        set { sourceRaw = newValue.rawValue }
+    }
 
     var matchedReceipt: Receipt?
     var trip: Trip?

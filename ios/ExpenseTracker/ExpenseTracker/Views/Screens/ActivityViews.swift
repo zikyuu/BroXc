@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import PhotosUI
 
 // MARK: - Activity feed
 
@@ -17,7 +18,7 @@ struct ActivityView: View {
                         chip(.all, "All", entries.count, show: false)
                         chip(.review, "Check match", entries.filter { $0.status == "needs_review" }.count)
                         chip(.noReceipt, "No receipt", entries.filter { $0.status == "unmatched" }.count)
-                        chip(.moneyIn, "Money in", entries.filter(\.isIncoming).count)
+                        chip(.moneyIn, "Money in", entries.filter { $0.isIncoming && !$0.outflow }.count)
                     }
                 }
                 .padding(.top, 4)
@@ -44,7 +45,7 @@ struct ActivityView: View {
         case .all: true
         case .review: e.status == "needs_review"
         case .noReceipt: e.status == "unmatched"
-        case .moneyIn: e.isIncoming
+        case .moneyIn: e.isIncoming && !e.outflow
         }
     }
 
@@ -90,6 +91,8 @@ struct TransactionView: View {
             Screen {
                 hero(t, incoming: incoming, single: single, count: real.count, ledger: ledger)
                 if t.status == "needs_review" { reviewCard(t) }
+                if t.transactionType == .transferOwnAccount { transferCard(t, ledger) }
+                if let receipt = t.matchedReceipt { ItemsDontAddUpCard(receipt: receipt) }
                 if !incoming, let guess = single, guess.isVirtual, guess.confidence == .suggested, let category = guess.category {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Guessed category: \(category.path.suffix(2).joined(separator: " › "))").font(.rounded(15, .bold))
@@ -126,7 +129,7 @@ struct TransactionView: View {
                         }
                         if !itemised {
                             NavigationLink(value: Route.breakdown(t)) {
-                                MenuRow("Break down into categories", hint: "e.g. a Splitwise settlement made of food, transport and souvenirs")
+                                MenuRow("Break down into items", hint: "e.g. your share of a Tricount: what you actually spent, by category")
                             }.buttonStyle(.plain)
                         }
                         NavigationLink(value: Route.classify(t)) { MenuRow("Not a purchase?", hint: "Mark it as money in: a reimbursement, top up, or your own category") }.buttonStyle(.plain)
@@ -167,6 +170,28 @@ struct TransactionView: View {
         .onDisappear { if (transaction.userNote ?? "") != note.trimmingCharacters(in: .whitespacesAndNewlines) { Actions.setNote(transaction, note, in: context) } }
     }
 
+    /// Whether the other half of a move between your own accounts has turned up.
+    @ViewBuilder
+    private func transferCard(_ t: YouTripTransaction, _ ledger: Ledger) -> some View {
+        let pairing = TransferPairing.pair(ledger.transactions, accounts: ledger.accounts)
+        let partner = pairing.partner[t.uid].flatMap { id in ledger.transactions.first { $0.uid == id } }
+        VStack(alignment: .leading, spacing: 6) {
+            if let partner {
+                Text("Moved between your own accounts ✓").font(.rounded(15, .bold))
+                Text("\(t.isOutflow ? "Out of \(ledger.info(t.account).name), into \(ledger.info(partner.account).name)" : "Out of \(ledger.info(partner.account).name), into \(ledger.info(t.account).name)") on \(partner.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"). It isn’t spending or income.")
+                    .font(.rounded(13)).foregroundStyle(Theme.muted)
+            } else if pairing.waiting.contains(where: { $0.uid == t.uid }) {
+                Text("Waiting for the other account").font(.rounded(15, .bold))
+                Text("The other half hasn’t shown up yet. DBS can take 2–3 days to post a transfer. Screenshot the other account again in a few days.")
+                    .font(.rounded(13)).foregroundStyle(Theme.muted)
+            } else {
+                Text("The other half is missing").font(.rounded(15, .bold))
+                Text("There’s no matching \(String(format: "$%.2f", abs(t.amountSGD ?? 0))) in your other accounts around this date. Screenshot the account it went to, or check the amount.")
+                    .font(.rounded(13))
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading).card(background: partner != nil ? Theme.greenBg : Theme.orangeBg, bordered: false)
+    }
+
     private func partialHint(_ t: YouTripTransaction) -> String? {
         guard t.transactionType == .reimbursement, let part = t.reimbursementAmount, part < (t.amountSGD ?? 0) - 0.005 else { return nil }
         return "\(Money.string(part)) counted as reimbursement, the rest as income"
@@ -179,8 +204,8 @@ struct TransactionView: View {
             else { IconTile(symbol: single?.category?.icon ?? "🧾", color: single?.category.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor, size: 56) }
             Text(t.transactionDescription ?? "Unknown charge").font(.rounded(20, .bold)).multilineTextAlignment(.center)
             Text([t.date?.formatted(.dateTime.day().month(.abbreviated).year()), t.trip?.name].compactMap { $0 }.joined(separator: " · ")).font(.rounded(13)).foregroundStyle(Theme.muted)
-            Text(incoming ? Money.string(t.amountSGD, sign: true) : Money.string(-(t.amountSGD ?? 0))).font(.rounded(36, .heavy)).foregroundStyle(incoming ? Theme.good : Theme.text)
-            Text((["YouTrip · SGD"] + (local.map { ["charged \($0)"] } ?? [])).joined(separator: " · ")).font(.rounded(12)).foregroundStyle(Theme.muted)
+            Text(incoming && !t.isOutflow ? Money.string(t.amountSGD, sign: true) : Money.string(-(t.amountSGD ?? 0))).font(.rounded(36, .heavy)).foregroundStyle(incoming && !t.isOutflow ? Theme.good : (incoming ? Theme.muted : Theme.text))
+            Text((["\(ledger.info(t.account).name) · SGD"] + (local.map { ["charged \($0)"] } ?? [])).joined(separator: " · ")).font(.rounded(12)).foregroundStyle(Theme.muted)
             HStack(spacing: 8) {
                 if !incoming {
                     Button { pickingTrip = true } label: {
@@ -236,6 +261,120 @@ struct TransactionView: View {
     }
 }
 
+// MARK: - Receipt check
+
+/// Shown when a receipt's lines don't add up to its printed total: the reader skipped or misread something.
+struct ItemsDontAddUpCard: View {
+    let receipt: Receipt
+    @Environment(\.modelContext) private var context
+    @Environment(Toaster.self) private var toaster
+    @State private var adding = false
+    @State private var name = "Missed item"
+    @State private var amount = ""
+    @State private var rereading = false
+    @State private var pending: PendingTranslation?
+    @State private var photoPick: PhotosPickerItem?
+    @State private var scanning = false
+
+    var body: some View {
+        if let gap = receipt.unexplainedAmount {
+            let currency = receipt.currency ?? ""
+            let sum = round2((receipt.total ?? 0) - gap)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("The items don’t add up to the total").font(.rounded(15, .bold))
+                Text(String(format: "The lines add up to %.2f %@ but the receipt says %.2f %@. ", sum, currency, receipt.total ?? 0, currency)
+                     + (gap > 0 ? String(format: "%.2f %@ isn’t on the list, so a line was probably missed.", gap, currency)
+                                : "The lines add up to more than the total, so a price was probably misread: tap an item to check it."))
+                    .font(.rounded(13))
+                Text("Take another photo (better light, or just the part that was missed): lines already here are kept, and only what’s missing is added.")
+                    .font(.rounded(12)).foregroundStyle(Theme.muted)
+                HStack {
+                    Menu {
+                        if DocumentScanner.isSupported { Button("Scan another photo", systemImage: "camera.viewfinder") { scanning = true } }
+                        PhotosPicker("Choose another photo", selection: $photoPick, matching: .images)
+                    } label: { Text(rereading ? "Reading…" : "Add another photo").padding(.horizontal, 12).padding(.vertical, 7) }
+                        .buttonStyle(.borderedProminent).disabled(rereading)
+                    if gap > 0 { Button("Add the missing line") { name = "Missed item"; amount = String(format: "%.2f", gap); adding = true }.buttonStyle(.bordered) }
+                }
+                if receipt.sourceImagePath?.isEmpty == false {
+                    Button("Or re-read the saved photo") { Task { await reread(from: nil) } }.font(.rounded(13, .semibold)).disabled(rereading)
+                }
+                if let raw = receipt.rawText, !raw.isEmpty {
+                    DisclosureGroup("What the camera read, line by line") {
+                        Text(raw).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }.font(.rounded(13, .semibold))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.orangeBg, bordered: false)
+            .translationHost($pending)
+            .onChange(of: photoPick) { _, item in
+                guard let item else { return }
+                Task {
+                    defer { photoPick = nil }
+                    if let data = try? await item.loadTransferable(type: Data.self), let image = ImageLoader.cgImage(from: data) { await reread(from: image) }
+                    else { toaster.show("That image couldn’t be opened.", error: true) }
+                }
+            }
+            .fullScreenCover(isPresented: $scanning) {
+                DocumentScanner(onScan: { image in
+                    scanning = false
+                    if let data = image.pngData(), let cg = ImageLoader.cgImage(from: data) { Task { await reread(from: cg) } }
+                }, onCancel: { scanning = false }).ignoresSafeArea()
+            }
+            .sheet(isPresented: $adding) {
+                NavigationStack {
+                    Form {
+                        Section("What was it?") { TextField("Name", text: $name) }
+                        Section("Price (\(currency))") { TextField("0.00", text: $amount).keyboardType(.decimalPad) }
+                    }
+                    .navigationTitle("Add missing line").navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) { Button("Cancel") { adding = false } }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("Add") {
+                                do {
+                                    try Actions.addLine(to: receipt, name: name, price: Double(amount.replacingOccurrences(of: ",", with: ".")) ?? 0, in: context)
+                                    toaster.show("Added"); adding = false
+                                } catch { toaster.show(error.localizedDescription, error: true) }
+                            }
+                        }
+                    }
+                }.presentationDetents([.medium])
+            }
+        }
+    }
+}
+
+extension ItemsDontAddUpCard {
+    /// Reads a photo (another one, or the saved one again) in several ways and merges in whatever it finds that closes the gap.
+    @MainActor
+    fileprivate func reread(from newImage: CGImage?) async {
+        let saved = receipt.sourceImagePath.flatMap { UIImage(contentsOfFile: URL.documentsDirectory.appending(path: $0).path)?.cgImage }
+        guard let total = receipt.total, let image = newImage ?? saved else {
+            toaster.show("The photo isn’t available to read again.", error: true); return
+        }
+        rereading = true
+        defer { rereading = false }
+        let existing = receipt.lineItems.sorted { $0.position < $1.position }.map {
+            ParsedLineItem(name: $0.originalName ?? $0.name, price: $0.price, quantity: $0.quantity, isDeposit: $0.isDeposit)
+        }
+        var entries = await ReceiptReader.reread(image, existing: existing, total: total)
+        // lines it found that weren't there are in Swedish: translate those like any other
+        let newOnes = entries.indices.filter { entries[$0].base == nil }
+        if !newOnes.isEmpty {
+            let outcome = await translateOnDevice(newOnes.map { ReceiptTranslation.prepared(entries[$0].item.name) }, via: $pending)
+            for (n, index) in newOnes.enumerated() {
+                entries[index].item.originalName = entries[index].item.name
+                if let texts = outcome.texts, texts.indices.contains(n) { entries[index].item.name = texts[n] }
+            }
+        }
+        let result = Actions.applyReread(entries, to: receipt, in: context)
+        if result.added + result.fixed == 0 { toaster.show("Nothing new found. Add the missing line by hand.") }
+        else if receipt.unexplainedAmount == nil { toaster.show("Found \(result.added) missing line\(result.added == 1 ? "" : "s") and fixed \(result.fixed) price\(result.fixed == 1 ? "" : "s"): it adds up now ✓") }
+        else { toaster.show("Found \(result.added) line\(result.added == 1 ? "" : "s"), fixed \(result.fixed) price\(result.fixed == 1 ? "" : "s"). Still short, see the card.") }
+    }
+}
+
 // MARK: - Receipt only
 
 struct ReceiptView: View {
@@ -259,6 +398,7 @@ struct ReceiptView: View {
                     if let c = receipt.currency, c != "SGD" { Text("printed in \(c)").font(.rounded(12)).foregroundStyle(Theme.muted) }
                     Button { pickingTrip = true } label: { Text(receipt.trip.map { "🧳 \($0.name)" } ?? "+ Trip").font(.rounded(13, .semibold)) }
                 }.frame(maxWidth: .infinity, alignment: .leading).card()
+                ItemsDontAddUpCard(receipt: receipt)
                 if let image = storedImage { image.resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous)) }
                 if let linked { NavigationLink(value: Route.transaction(linked)) { MenuRow("Open the linked transaction") }.buttonStyle(.plain).flushCard() }
                 else { candidates(ledger) }
@@ -411,6 +551,10 @@ struct ClassifyView: View {
     /// Money in can only be a reimbursement, a top-up from your own account, or a category you made yourself.
     /// (A refund is only offered when it was already marked as one.)
     private var options: [Option] {
+        // money leaving an account can only be a move into another of your own accounts (or a purchase, via the button below)
+        if transaction.isOutflow {
+            return [Option(type: .transferOwnAccount, label: nil, icon: "🔁", title: "Move to my own account", hint: "Between your accounts: not spending")]
+        }
         var list = [Option(type: .reimbursement, label: nil, icon: "🤝", title: "Reimbursement", hint: "Reduces your “owed back” balance"),
                     Option(type: .transferOwnAccount, label: nil, icon: "🔁", title: "Top up", hint: "Money from your own account: not income")]
         list += labels.map { Option(type: .income, label: $0.name, icon: "💰", title: $0.name, hint: "Your own category") }
@@ -536,7 +680,8 @@ struct BreakdownView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(Toaster.self) private var toaster
 
-    struct DraftRow: Identifiable { let id = UUID(); var category: Category?; var amount = "" }
+    struct DraftRow: Identifiable { let id = UUID(); var name = ""; var category: Category?; var amount = "" }
+    @State private var pickingTrip = false
     @State private var rows: [DraftRow] = []
     @State private var pickingRow: UUID?
     @State private var loaded = false
@@ -552,11 +697,16 @@ struct BreakdownView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(transaction.transactionDescription ?? "Transaction") · \(Money.string(total))").font(.rounded(15, .bold))
-                        Text("Say what this payment was made of, for example a Splitwise settlement covering food, transport and souvenirs. These amounts are the same money, not extra, so your total doesn’t change. Anything you leave out stays Unsorted.")
+        Text("Say what this payment was made of, for example your share of a Tricount or Splitwise: list what you actually spent, with a category for each. These amounts are the same money, not extra, so your total doesn’t change. Anything you leave out stays Unsorted.")
                             .font(.rounded(13)).foregroundStyle(Theme.muted)
                     }.frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.blueBg, bordered: false)
+                    Button { pickingTrip = true } label: {
+                        Rows { MenuRow("Trip", hint: "The items below count toward it") { Text(transaction.trip.map { "🧳 \($0.name)" } ?? "None").font(.rounded(14)).foregroundStyle(Theme.muted) } }.flushCard()
+                    }.buttonStyle(.plain)
                     VStack(spacing: 10) {
                         ForEach($rows) { $row in
+                          VStack(alignment: .leading, spacing: 6) {
+                            TextField("What was it? (e.g. Dinner, Louvre tickets)", text: $row.name).font(.rounded(14))
                             HStack(spacing: 8) {
                                 Button { pickingRow = row.id } label: {
                                     HStack { if let c = row.category { CategoryChip(category: c, confidence: .confirmed, full: true) } else { Text("Choose category").foregroundStyle(Theme.muted).font(.rounded(14)) }; Spacer(minLength: 0) }
@@ -564,6 +714,7 @@ struct BreakdownView: View {
                                 HStack(spacing: 2) { Text("$"); TextField("0.00", text: $row.amount).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 70) }.font(.rounded(15, .bold))
                                 Button { rows.removeAll { $0.id == row.id }; if rows.isEmpty { rows = [DraftRow()] } } label: { Image(systemName: "xmark").foregroundStyle(Theme.muted) }.buttonStyle(.plain)
                             }
+                          }
                         }
                         Button { rows.append(DraftRow()) } label: { Text("+ Add another").font(.rounded(14, .semibold)).frame(maxWidth: .infinity).padding(.vertical, 8) }.buttonStyle(.bordered)
                     }.card()
@@ -575,7 +726,8 @@ struct BreakdownView: View {
                     PrimaryButton(title: "Save breakdown", disabled: assigned <= 0 || remaining < -0.005) {
                         let parts = rows.compactMap { r -> BreakdownPart? in
                             guard let amount = Double(r.amount.replacingOccurrences(of: ",", with: ".")), amount > 0 else { return nil }
-                            return BreakdownPart(category: r.category, amount: amount, name: r.category?.name)
+                            let typed = r.name.trimmingCharacters(in: .whitespaces)
+                            return BreakdownPart(category: r.category, amount: amount, name: typed.isEmpty ? r.category?.name : typed)
                         }
                         do { try Actions.breakdown(transaction, parts: parts, in: context); toaster.show("Broken down"); dismiss() }
                         catch { toaster.show(error.localizedDescription, error: true) }
@@ -591,8 +743,9 @@ struct BreakdownView: View {
                 guard !loaded else { return }
                 loaded = true
                 let existing = ledger.items(of: transaction).filter { $0.name != "Unsorted remainder" && $0.category != nil && !$0.isVirtual }
-                rows = existing.isEmpty ? [DraftRow()] : existing.map { DraftRow(category: $0.category, amount: String(format: "%.2f", $0.priceSGD ?? $0.price)) }
+                rows = existing.isEmpty ? [DraftRow()] : existing.map { DraftRow(name: $0.name == $0.category?.name ? "" : $0.name, category: $0.category, amount: String(format: "%.2f", $0.priceSGD ?? $0.price)) }
             }
+            .sheet(isPresented: $pickingTrip) { TripPicker(current: transaction.trip) { Actions.assign(transaction, to: $0, in: context); toaster.show("Trip updated") } }
         }
         .navigationTitle("Break down").navigationBarTitleDisplayMode(.inline)
     }

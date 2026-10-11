@@ -124,11 +124,53 @@ enum ReceiptReader {
         let ocr = try await VisionOCR.recognize(image, languages: ["sv-SE", "en-US"])
         var draft = ReceiptParser.parse(ocr, sourceImagePath: sourceImagePath, joinStackedLogo: true)
         draft.merchantOriginal = draft.merchant   // a store's name isn't translated: it's what YouTrip shows too
+        // lines that don't add up to the printed total mean something was misread: read it other ways and combine
+        if let total = draft.total, !ReceiptMerge.closes(draft.items.map { $0 }, total: total) {
+            let others = await alternativeReadings(image, sourceImagePath: sourceImagePath)
+            if let whole = others.first(where: { ReceiptMerge.closes($0.items, total: total) }) {
+                draft.items = whole.items; draft.repairs += whole.repairs
+                draft.repairs.append("Read the photo a second way, which added up.")
+            } else {
+                let entries = ReceiptMerge.combine(base: draft.items, total: total, others: others.map(\.items))
+                if entries.contains(where: { $0.base == nil }) || entries.contains(where: { $0.base != nil && $0.item.price != draft.items[$0.base!].price }) {
+                    draft.items = entries.map(\.item)
+                    draft.repairs.append("Read the photo several ways and combined what each found.")
+                }
+            }
+        }
         return draft
     }
 
-    static func readTransactions(_ image: CGImage) async throws -> [ParsedTransaction] {
-        YouTripParser.parse(try await VisionOCR.recognize(image, languages: ["en-US"]))
+    /// The same image read with Vision's word correction off, and enlarged with more contrast: each tends to catch
+    /// different lines than the first read.
+    static func alternativeReadings(_ image: CGImage, sourceImagePath: String?) async -> [ReceiptDraft] {
+        var drafts: [ReceiptDraft] = []
+        let variants: [(CGImage?, Bool)] = [(image, false), (ImagePrep.enhanced(image), false), (ImagePrep.enhanced(image), true)]
+        for (picture, correction) in variants {
+            guard let picture, let ocr = try? await VisionOCR.recognize(picture, languages: ["sv-SE", "en-US"], correction: correction) else { continue }
+            drafts.append(ReceiptParser.parse(ocr, sourceImagePath: sourceImagePath, joinStackedLogo: true))
+        }
+        return drafts
+    }
+
+    /// Reads an already-saved receipt's photo again and merges what it finds into the lines the receipt already has.
+    static func reread(_ image: CGImage, existing: [ParsedLineItem], total: Double) async -> [ReceiptMerge.Entry] {
+        var readings = await alternativeReadings(image, sourceImagePath: nil)
+        if let ocr = try? await VisionOCR.recognize(image, languages: ["sv-SE", "en-US"]) {
+            readings.insert(ReceiptParser.parse(ocr, joinStackedLogo: true), at: 0)
+        }
+        return ReceiptMerge.combine(base: existing, total: total, others: readings.map(\.items))
+    }
+
+    /// Any of the three transaction-list screenshots: works out which app it is from and reads it accordingly.
+    static func readTransactions(_ image: CGImage) async throws -> (kind: ScreenshotKind, transactions: [ParsedTransaction], hint: (name: String?, number: String?)) {
+        let ocr = try await VisionOCR.recognize(image, languages: ["en-US"])
+        let rows = RowGrouping.rows(ocr.lines).map(\.text)
+        switch ScreenshotKind.detect(rows) {
+        case .dbs: return (.dbs, DBSParser.parse(rows: rows), DBSParser.accountHint(rows: rows))
+        case .paylah: return (.paylah, PayLahParser.parse(ocr, image: image), (nil, nil))
+        case .youtrip: return (.youtrip, YouTripParser.parse(ocr), (nil, nil))
+        }
     }
 }
 

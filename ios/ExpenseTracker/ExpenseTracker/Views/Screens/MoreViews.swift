@@ -225,40 +225,52 @@ struct ReviewView: View {
 struct BalanceView: View {
     @Environment(\.modelContext) private var context
     @Environment(Toaster.self) private var toaster
+    @State private var account: Account
     @State private var amount = ""
     @State private var date = Date()
 
+    init(account: Account = .dbs) { _account = State(initialValue: account) }
+
     var body: some View {
         WithLedger { ledger in
-            let current = ledger.currentBalance
+            let current = ledger.currentBalance(for: account)
+            let tracked = ledger.transactions.contains { $0.account == account }
             Screen {
+                if ledger.accounts.count <= 4 {
+                    SegmentedTabs(options: ledger.accounts.map { ($0.account, $0.name) }, selection: $account)
+                } else {
+                    Picker("Account", selection: $account) { ForEach(ledger.accounts) { Text($0.name).tag($0.account) } }.pickerStyle(.menu)
+                }
+                NavigationLink(value: Route.accounts) { Text("Manage accounts").font(.rounded(13, .semibold)) }
                 VStack(alignment: .leading, spacing: 6) {
                     if let current {
-                        Text("Balance implied by your records").font(.rounded(12)).foregroundStyle(Theme.muted)
+                        Text(tracked ? "Balance implied by your records" : "Balance you last entered").font(.rounded(12)).foregroundStyle(Theme.muted)
                         Text(Money.string(current.implied)).font(.rounded(30, .heavy))
                         Text("Last checked \(current.reconciledOn.formatted(.dateTime.day().month(.abbreviated).year())) at \(Money.string(current.reconciledAmount)), then moved by everything recorded since.")
                             .font(.rounded(12)).foregroundStyle(Theme.muted)
                     } else {
-                        Text("Check your real balance now and then").font(.rounded(16, .bold))
-                        Text("Enter what your card actually shows. The first check is a starting point; later ones reveal money the records can’t explain.").font(.rounded(13)).foregroundStyle(Theme.muted)
+                        Text("Check your real \(ledger.info(account).name) balance now and then").font(.rounded(16, .bold))
+                        Text("Enter what \(ledger.info(account).name) actually shows. The first check is a starting point; later ones reveal money the records can’t explain.").font(.rounded(13)).foregroundStyle(Theme.muted)
+                        if !tracked { Text("\(ledger.info(account).name) screenshots can’t be imported yet, so for now this just keeps its balance visible on Home.").font(.rounded(12)).foregroundStyle(Theme.muted) }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).card()
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("What does your card show right now?").font(.rounded(13, .semibold)).foregroundStyle(Theme.muted)
+                    Text("What does \(ledger.info(account).name) show right now?").font(.rounded(13, .semibold)).foregroundStyle(Theme.muted)
                     HStack { Text("$").font(.rounded(20, .bold)); TextField(current.map { String(format: "%.2f", $0.implied) } ?? "0.00", text: $amount).keyboardType(.decimalPad).font(.rounded(20, .bold)) }
                         .padding(12).background(Theme.bg, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     DatePicker("As of", selection: $date, in: ...Date(), displayedComponents: .date).font(.rounded(14))
                     PrimaryButton(title: "Save balance", disabled: Double(amount.replacingOccurrences(of: ",", with: ".")) == nil) {
                         guard let value = Double(amount.replacingOccurrences(of: ",", with: ".")) else { return }
-                        let first = ledger.latestReconciliation == nil
-                        let result = Actions.reconcile(actual: value, on: date.startOfDay, ledger: ledger, in: context)
+                        let first = ledger.latestReconciliation(for: account) == nil
+                        let result = Actions.reconcile(actual: value, on: date.startOfDay, account: account, ledger: ledger, in: context)
                         toaster.show(first ? "Saved as your starting point" : result.gap > 0.005 ? "\(Money.string(result.gap)) untracked" : result.gap < -0.005 ? "\(Money.string(-result.gap)) more than expected" : "Everything adds up")
                         amount = ""
                     }
                 }.card()
                 (Text("? Untracked ").bold() + Text("is money that left with no record at all: no merchant, no date, no category. The app won’t invent any. It shows as a grey ? on your spending map so the totals still add up."))
                     .font(.rounded(13)).card(background: Theme.blueBg, bordered: false)
-                let history = ledger.reconciliations.sorted { $0.createdAt > $1.createdAt }
+                transfersSection(ledger)
+                let history = ledger.reconciliations.filter { $0.account == account }.sorted { $0.createdAt > $1.createdAt }
                 if !history.isEmpty {
                     SectionTitle("Past checks")
                     Rows { ForEach(history) { r in
@@ -275,6 +287,33 @@ struct BalanceView: View {
             }
         }
         .navigationTitle("Balance check").navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+extension BalanceView {
+    /// Transfers between your accounts that haven't found their other half: the usual reason a balance doesn't add up.
+    @ViewBuilder
+    fileprivate func transfersSection(_ ledger: Ledger) -> some View {
+        let pairing = TransferPairing.pair(ledger.transactions, accounts: ledger.accounts)
+        let mine = { (t: YouTripTransaction) in t.account == account }
+        let waiting = pairing.waiting.filter(mine), missing = pairing.missing.filter(mine)
+        let paired = ledger.transactions.filter { pairing.partner[$0.uid] != nil && $0.account == account }
+        if !waiting.isEmpty || !missing.isEmpty || !paired.isEmpty {
+            SectionTitle("Moves between your accounts")
+            VStack(alignment: .leading, spacing: 8) {
+                if !paired.isEmpty { Text("✓ \(paired.count) matched on both sides").font(.rounded(13)) }
+                ForEach(waiting) { t in
+                    NavigationLink(value: Route.transaction(t)) {
+                        Text("⏳ \(Money.string(abs(t.amountSGD ?? 0))) \(t.isOutflow ? "out of" : "into") \(ledger.info(t.account).name) on \(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"): waiting for the other account").font(.rounded(13)).foregroundStyle(Theme.muted)
+                    }.buttonStyle(.plain)
+                }
+                ForEach(missing) { t in
+                    NavigationLink(value: Route.transaction(t)) {
+                        Text("⚠️ \(Money.string(abs(t.amountSGD ?? 0))) \(t.isOutflow ? "out of" : "into") \(ledger.info(t.account).name) on \(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"): no matching move in your other accounts").font(.rounded(13))
+                    }.buttonStyle(.plain)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).card()
+        }
     }
 }
 
@@ -340,8 +379,8 @@ struct AddView: View {
             }
             receiptCard
             VStack(alignment: .leading, spacing: 10) {
-                Text("YouTrip charges").font(.rounded(17, .bold))
-                Text("Screenshot your YouTrip transaction list. Overlapping screenshots are fine: charges you’ve already saved are skipped.").font(.rounded(13)).foregroundStyle(Theme.muted)
+                Text("Transactions").font(.rounded(17, .bold))
+                Text("Screenshot the transaction list from YouTrip, PayLah or your DBS account history: the app works out which one it is. Overlapping screenshots are fine: ones you’ve already saved are skipped.").font(.rounded(13)).foregroundStyle(Theme.muted)
                 PhotosPicker(selection: $youtripPick, matching: .images) { pickerLabel("Choose screenshot", systemImage: "photo") }
                 if working == "youtrip" { ProgressView("Reading the image…") }
                 if let youtripResult { Text(youtripResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
@@ -394,11 +433,16 @@ struct AddView: View {
         defer { working = nil; youtripPick = nil }
         do {
             guard let data = try await item.loadTransferable(type: Data.self), let image = ImageLoader.cgImage(from: data) else { throw AppError("That image couldn’t be opened.") }
-            let parsed = try await ReceiptReader.readTransactions(image)
-            if parsed.isEmpty { throw AppError("No charges found. Make sure the screenshot shows the transaction list.") }
-            let saved = Actions.saveNew(parsed, in: context)
+            let read = try await ReceiptReader.readTransactions(image)
+            // which of your accounts this is: DBS shows the account name and number above the list
+            let account = Actions.resolveAccount(kind: read.kind, hint: read.hint, in: context)
+            let parsed = read.transactions.map { row -> ParsedTransaction in var r = row; r.account = account; return r }
+            if parsed.isEmpty { throw AppError("No transactions found. Make sure the screenshot shows the transaction list.") }
+            let saved = Actions.saveNew(Actions.settleTransfers(parsed, in: context), in: context)
+            Actions.relinkTransfers(in: context)
             let matches = Matcher.run(in: context)
-            youtripResult = "Found \(parsed.count) charge\(parsed.count == 1 ? "" : "s"): \(saved.added) new, \(saved.skipped) already saved. \(matches.count) receipt\(matches.count == 1 ? "" : "s") linked."
+            let from = Actions.accountName(parsed.first?.account ?? .youtrip, in: context)
+            youtripResult = "\(from): found \(parsed.count) transaction\(parsed.count == 1 ? "" : "s"), \(saved.added) new, \(saved.skipped) already saved. \(matches.count) receipt\(matches.count == 1 ? "" : "s") linked."
         } catch { toaster.show(error.localizedDescription, error: true) }
     }
 
@@ -447,7 +491,8 @@ struct AddView: View {
 
     /// A receipt is in: go to Activity (where it now is) instead of leaving you on this page.
     private func finishAdding(_ draft: ReceiptDraft, matched: Matcher.Result?) {
-        toaster.show("Added \(draft.merchant ?? "receipt"): \(draft.items.count) item\(draft.items.count == 1 ? "" : "s")" + (matched != nil ? ", linked ✓" : ", no charge yet"))
+        toaster.show("Added \(draft.merchant ?? "receipt"): \(draft.items.count) item\(draft.items.count == 1 ? "" : "s")" + (matched != nil ? ", linked ✓" : ", no charge yet")
+                     + (draft.repairs.isEmpty ? "" : " · fixed \(draft.repairs.count) unclear price\(draft.repairs.count == 1 ? "" : "s") from the total"))
         dismiss()
         navigation.selectedTab = .activity
     }
@@ -468,13 +513,14 @@ struct MoreView: View {
     var body: some View {
         Screen {
             Rows {
-                link(.add, "📥", "Add screenshots", "YouTrip charges and receipts")
+                link(.add, "📥", "Add screenshots", "YouTrip, PayLah, DBS and receipts")
                 link(.review, "👀", "Needs a look", "Optional: confirm the app’s guesses")
                 link(.search, "🔎", "Search", "Items, merchants, categories, trips")
             }.flushCard()
             Rows {
                 link(.trends, "📈", "Trends", "Monthly patterns, usual vs now")
                 link(.balance, "⚖️", "Balance check", "Find money the records can’t explain")
+                link(.accounts, "🏦", "Accounts", "Your DBS accounts, PayLah, YouTrip and more")
                 link(.categories, "🗂️", "Categories", "Your own hierarchy and budgets")
             }.flushCard()
             Rows {
@@ -496,5 +542,91 @@ struct MoreView: View {
                 Spacer(); Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.mutedLine)
             }.padding(.horizontal, 16).padding(.vertical, 10).rowDivider()
         }.buttonStyle(.plain)
+    }
+}
+
+// MARK: - Accounts
+
+/// Your accounts: add a second DBS account, a fixed deposit, and so on. Screenshots are matched to an account by the
+/// number DBS prints in the header, so each account's history lands on the right balance.
+struct AccountsView: View {
+    @Environment(\.modelContext) private var context
+    @Environment(Toaster.self) private var toaster
+    @State private var adding = false
+    @State private var editing: BankAccount?
+    @Query(sort: \BankAccount.sortOrder) private var accounts: [BankAccount]
+
+    var body: some View {
+        WithLedger { ledger in
+            Screen {
+                Text("Money moving between your own accounts is never spending. Each account keeps its own balance, so a transfer from your fixed deposit shows up on both sides.")
+                    .font(.rounded(13)).foregroundStyle(Theme.muted)
+                Rows {
+                    ForEach(accounts) { account in
+                        Button { editing = account } label: {
+                            MenuRow("\(account.kind.icon) \(account.name)", hint: [account.kind.label, account.number].compactMap { $0 }.joined(separator: " · ")) {
+                                Text(ledger.currentBalance(for: Account(rawValue: account.key)).map { Money.whole($0.implied) } ?? "no balance").font(.rounded(14, .bold))
+                            }
+                        }.buttonStyle(.plain)
+                        .reorderableAccount(account.key)
+                    }
+                }.flushCard()
+                Text("Press and hold an account, then drag it where you want it. The order here is the order on Home.").font(.rounded(12)).foregroundStyle(Theme.muted)
+                PrimaryButton(title: "Add an account") { adding = true }
+            }
+        }
+        .navigationTitle("Accounts").navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $adding) { AccountEditSheet(account: nil) }
+        .sheet(item: $editing) { AccountEditSheet(account: $0) }
+    }
+}
+
+struct AccountEditSheet: View {
+    let account: BankAccount?
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var context
+    @Environment(Toaster.self) private var toaster
+    @State private var name = ""
+    @State private var kind = AccountKind.bank
+    @State private var number = ""
+    @State private var confirmDelete = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Name") { TextField("e.g. DBS fixed deposit", text: $name) }
+                Section("Kind") { Picker("Kind", selection: $kind) { ForEach(AccountKind.allCases) { Text($0.label).tag($0) } } }
+                Section {
+                    TextField("e.g. 123-45678-9", text: $number)
+                } header: { Text("Account number (optional)") } footer: { Text("DBS prints it under the account name. With it, a screenshot of this account is recognised and filed here automatically.") }
+                if let account {
+                    Section { Button("Delete this account", role: .destructive) { confirmDelete = true } }
+                        .confirmationDialog("Delete “\(account.name)”?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                            Button("Delete", role: .destructive) {
+                                do { try Actions.deleteAccount(account, in: context); dismiss() } catch { toaster.show(error.localizedDescription, error: true) }
+                            }
+                        }
+                }
+            }
+            .navigationTitle(account == nil ? "New account" : "Edit account").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        do {
+                            if let account {
+                                account.name = name.trimmingCharacters(in: .whitespaces); account.kind = kind
+                                account.number = number.trimmingCharacters(in: .whitespaces).nilIfEmpty
+                                try? context.save()
+                                Actions.relinkTransfers(in: context)
+                            } else { try Actions.addAccount(name: name, kind: kind, number: number, in: context); Actions.relinkTransfers(in: context) }
+                            dismiss()
+                        } catch { toaster.show(error.localizedDescription, error: true) }
+                    }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .onAppear { if let account { name = account.name; kind = account.kind; number = account.number ?? "" } }
+        }
+        .presentationDetents([.large])
     }
 }

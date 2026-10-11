@@ -210,7 +210,7 @@ struct TransactionRow: View {
     private var subtitle: String {
         var parts: [String] = []
         if showDate, let date = entry.date { parts.append(date.formatted(.dateTime.day().month(.abbreviated))) }
-        if entry.isIncoming { parts.append(entry.transaction?.incomeLabel ?? Self.incomingLabel[entry.type] ?? "Money in") }
+        if entry.isIncoming { parts.append(entry.outflow && entry.type == .transferOwnAccount ? "Transfer out" : (entry.transaction?.incomeLabel ?? Self.incomingLabel[entry.type] ?? "Money in")) }
         else if entry.status == "receipt_only" { parts.append("Receipt · no charge linked yet") }
         else if let c = entry.category, c.mixed { parts.append("\(c.distinct) categories") }
         else if let c = entry.category?.category {
@@ -233,19 +233,20 @@ struct TransactionRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.title).font(.rounded(15, .semibold)).lineLimit(1)
                 Text(subtitle).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
-                if entry.trip != nil || entry.status == "needs_review" || entry.status == "unmatched" || entry.category?.confidence == .suggested {
+                if entry.trip != nil || entry.status == "needs_review" || entry.status == "unmatched" || entry.category?.confidence == .suggested || entry.matchedReceipt?.unexplainedAmount != nil {
                     HStack(spacing: 5) {
                         if let trip = entry.trip { MiniChip(text: trip.name, style: .trip) }
                         if entry.status == "needs_review" { MiniChip(text: "check match", style: .warn) }
                         if entry.status == "unmatched" { MiniChip(text: "no receipt", style: .quiet) }
+                        if entry.matchedReceipt?.unexplainedAmount != nil { MiniChip(text: "items don’t add up", style: .warn) }
                         if !entry.isIncoming, entry.category?.confidence == .suggested { MiniChip(text: "guessed", style: .quiet) }
                     }.lineLimit(1)
                 }
             }
             Spacer(minLength: 6)
             VStack(alignment: .trailing, spacing: 2) {
-                Text(entry.isIncoming ? Money.string(entry.amountSGD, sign: true) : Money.string(split ? entry.personalSGD : entry.amountSGD))
-                    .font(.rounded(15, .semibold)).foregroundStyle(entry.isIncoming ? Theme.good : Theme.text)
+                Text(entry.isIncoming ? (entry.outflow ? Money.string(-(entry.amountSGD ?? 0)) : Money.string(entry.amountSGD, sign: true)) : Money.string(split ? entry.personalSGD : entry.amountSGD))
+                    .font(.rounded(15, .semibold)).foregroundStyle(entry.isIncoming ? (entry.outflow ? Theme.muted : Theme.good) : Theme.text)
                 if split { Text("of \(Money.string(entry.amountSGD))").font(.rounded(11)).foregroundStyle(Theme.muted) }
             }
         }
@@ -304,6 +305,8 @@ enum Route: Hashable {
     case trip(Trip)
     case tripMode
     case search, trends, review, balance, categories, add, more
+    case account(Account)
+    case accounts
 }
 
 /// Reads everything the engine needs and hands screens a fresh `Ledger`. SwiftData re-renders this when
@@ -316,10 +319,11 @@ struct WithLedger<Content: View>: View {
     @Query private var reconciliations: [BalanceReconciliation]
     @Query private var checkpoints: [BalanceCheckpoint]
     @Query private var rules: [ItemRule]
+    @Query private var accounts: [BankAccount]
     @ViewBuilder let content: (Ledger) -> Content
     var body: some View {
         content(Ledger(receipts: receipts, transactions: transactions, categories: categories, trips: trips,
-                       reconciliations: reconciliations, checkpoints: checkpoints, rules: rules))
+                       reconciliations: reconciliations, checkpoints: checkpoints, rules: rules, accounts: accounts))
     }
 }
 

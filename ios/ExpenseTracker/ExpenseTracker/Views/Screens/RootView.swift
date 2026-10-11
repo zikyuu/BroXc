@@ -22,6 +22,8 @@ struct RouteView: View {
         case .trends: TrendsView()
         case .review: ReviewView()
         case .balance: BalanceView()
+        case .account(let account): BalanceView(account: account)
+        case .accounts: AccountsView()
         case .categories: CategoriesView()
         case .add: AddView()
         case .more: MoreView()

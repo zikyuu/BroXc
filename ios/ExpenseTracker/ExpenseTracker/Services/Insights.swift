@@ -70,8 +70,12 @@ struct ActivityEntry: Identifiable {
     let othersSGD: Double
     let itemCount: Int
     let category: EntryCategory?
+    /// A transfer out of its account (DBS topping up PayLah): not spending, but money does leave.
+    var outflow = false
 
     var isIncoming: Bool { type != .expense }
+    /// The receipt this row stands for or is linked to.
+    var matchedReceipt: Receipt? { receipt ?? transaction?.matchedReceipt }
 }
 
 enum PaceStatus { case good, watch, over, neutral }
@@ -337,25 +341,32 @@ extension Ledger {
 
     // MARK: balance
 
-    func movement(since cutoff: Date?) -> Double {
+    func movement(since cutoff: Date?, account: Account = .youtrip) -> Double {
         transactions.reduce(0) { sum, t in
+            if t.account != account { return sum }
             if let cutoff, t.createdAt <= cutoff { return sum }
             let amount = abs(t.amountSGD ?? 0)
-            return sum + (t.transactionType == .expense ? -amount : amount)
+            return sum + ((t.transactionType == .expense || t.isOutflow) ? -amount : amount)
         }
     }
 
-    var latestReconciliation: BalanceReconciliation? { reconciliations.max { $0.createdAt < $1.createdAt } }
+    func latestReconciliation(for account: Account) -> BalanceReconciliation? {
+        reconciliations.filter { $0.account == account }.max { $0.createdAt < $1.createdAt }
+    }
+    var latestReconciliation: BalanceReconciliation? { latestReconciliation(for: .youtrip) }
 
-    var currentBalance: BalanceInfo? {
-        guard let last = latestReconciliation else { return nil }
-        return BalanceInfo(implied: round2(last.actualSGD + movement(since: last.knownThrough)),
+    /// The balance the records imply for one account: its last check plus everything recorded on it since.
+    func currentBalance(for account: Account) -> BalanceInfo? {
+        guard let last = latestReconciliation(for: account) else { return nil }
+        return BalanceInfo(implied: round2(last.actualSGD + movement(since: last.knownThrough, account: account)),
                            reconciledOn: last.reconciledOn, reconciledAmount: last.actualSGD)
     }
+    var currentBalance: BalanceInfo? { currentBalance(for: .youtrip) }
 
-    /// Missing money found by balance checks dated in this month. Extra money (a negative gap) isn't spending.
+    /// Missing money found by YouTrip balance checks dated in this month (that's where spending happens for now).
+    /// Extra money (a negative gap) isn't spending. A gap on another account can be a transfer, so it isn't counted.
     func untracked(in month: MonthKey) -> Double {
-        reconciliations.filter { MonthKey($0.reconciledOn) == month && $0.untrackedSGD > 0 }.reduce(0) { $0 + $1.untrackedSGD }
+        reconciliations.filter { $0.account == .youtrip && MonthKey($0.reconciledOn) == month && $0.untrackedSGD > 0 }.reduce(0) { $0 + $1.untrackedSGD }
     }
 
     // MARK: bottle deposit
@@ -391,7 +402,7 @@ extension Ledger {
                 transaction: t, receipt: t.matchedReceipt,
                 personalSGD: round2(real.reduce(0) { $0 + ($1.personalSGD ?? 0) }),
                 othersSGD: round2(real.reduce(0) { $0 + ($1.othersSGD ?? 0) }),
-                itemCount: real.count, category: entryCategory(group)))
+                itemCount: real.count, category: entryCategory(group), outflow: t.isOutflow))
         }
         let matched = Set(transactions.compactMap { $0.matchedReceipt?.persistentModelID })
         for receipt in receipts where !matched.contains(receipt.persistentModelID) {
