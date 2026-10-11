@@ -72,6 +72,12 @@ enum ReceiptParser {
                amountPattern.test(tail), stripAmount(tail).filter({ $0.isLetter || $0.isNumber }).count <= 1 {
                 merged.append((row.text + " " + rows[index + 1].text, min(row.confidence, rows[index + 1].confidence)))
                 index += 2
+            } else if index + 1 < rows.count, !amountPattern.test(head), head.filter(\.isLetter).count >= 3, fragmentPattern.test(tail) {
+                // "Bacon" over ",99": the leading digits of the price were lost. Keep the row, marked, and let the
+                // receipt's total say what the price must have been.
+                let cents = tail.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ".", with: ",")
+                merged.append((row.text + " 0" + cents + unclearMark, min(row.confidence, rows[index + 1].confidence)))
+                index += 2
             } else {
                 merged.append(row)
                 index += 1
@@ -80,6 +86,12 @@ enum ReceiptParser {
         return merged
     }
 
+    /// A price whose leading digits didn't survive reading: ",99".
+    private static let fragmentPattern = Rx(#"^\s*[.,]\d{2}\s*$"#)
+    private static let unclearMark = "\u{1}"
+    /// "28 3,50": a stray character split the price "28,50" in two.
+    private static let splitPricePattern = Rx(#"(\d{1,4})\s+\d[.,](\d{2})\s*$"#)
+
     /// "103,16 SEK/kg" is the price per kilo, not part of the item's name.
     private static let perKiloPattern = Rx(#"\d+[.,]\s?\d{2}\s*(?:SEK|kr)?\s*/\s*kg"#, ignoreCase: true)
 
@@ -87,7 +99,7 @@ enum ReceiptParser {
     // price per kilo). Both carry a price that is NOT the line's price, so they're lifted out before looking for
     // the amount; OCR also swaps characters (Cyrillic "г" for "g", "·" for "*"), hence the loose bits.
     private static let countMarker = Rx(#"(\d+)\s*st\s*[*·x×]\s*\d+[.,]\d{2}"#, ignoreCase: true)
-    private static let weightMarker = Rx(#"(\d+[.,]\d{3})\s*k\S{1,2}\s*[*·x×]\s*\d+[.,]\d{2}\s*\S{0,5}/\s*\S{0,3}"#, ignoreCase: true)
+    private static let weightMarker = Rx(#"(\d+[.,]\d{3})\s*k\S{1,2}\s*[*·x×]\s*\d+[.,]\s?\d{2}[^/]{0,8}/\s*\S{0,3}"#, ignoreCase: true)
 
     /// The quantity a "2st*16,85" / "0,575kg*10,35Kr/kg" marker states, plus the row with the marker removed.
     private static func extractMarker(_ text: String) -> (quantity: Double, rest: String)? {
@@ -103,10 +115,31 @@ enum ReceiptParser {
     /// Row text with any quantity/weight marker taken out.
     private static func body(_ text: String) -> String { extractMarker(text)?.rest ?? text }
 
-    /// OCR can space a keyword out ("T otal") - compare with everything but letters dropped.
+    /// OCR misreads and spaces out keywords ("lotal", "T otal"): a row that starts with something one character away from
+    /// "total"/"totalt", has an amount and a currency word, is the total.
     private static func looksLikeTotal(_ text: String) -> Bool {
-        text.lowercased().filter(\.isLetter).hasPrefix("total") && amountPattern.test(text)
+        guard amountPattern.test(text) else { return false }
+        let lowered = text.lowercased()
+        if lowered.filter(\.isLetter).hasPrefix("total") { return true }
+        guard currencyPattern.test(text), let first = lowered.split(whereSeparator: { !$0.isLetter }).first.map(String.init) else { return false }
+        return ["total", "totalt"].contains { editDistance(first, $0) <= 1 }
     }
+
+    private static func editDistance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        var previous = Array(0...b.count)
+        for i in 1...max(a.count, 1) where !a.isEmpty {
+            var row = [i]
+            for j in 1...max(b.count, 1) where !b.isEmpty {
+                row.append(min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)))
+            }
+            previous = row
+        }
+        return previous.last ?? max(a.count, b.count)
+    }
+
+    /// The tax table and the card slip come after the items, whether or not the total row itself was readable.
+    private static let footerWords = ["netto", "brutto", "kontokort", "mottaget"]
 
     /// Store name off the original-language receipt, kept as printed so it can be compared against the
     /// (untranslated) description YouTrip shows.
@@ -122,9 +155,47 @@ enum ReceiptParser {
         return name
     }
 
+    /// Uses the receipt's own total as a checksum. Where a price was read two ways, or only its cents survived, the
+    /// reading under which the lines add up to the total exactly is the right one. Never guesses: if no reading closes
+    /// the gap, nothing changes.
+    private static func repairPrices(_ items: inout [ParsedLineItem], total: Double, alternatives: [Int: Double],
+                                     unclear: [Int: Double]) -> [String] {
+        guard unclear.count <= 1 else { return [] }
+        let indexes = alternatives.keys.sorted()
+        // a price with a stray digit beside it is the less trustworthy reading, so try swapping all of them first
+        let masks = (0..<(1 << indexes.count)).sorted { $0.nonzeroBitCount > $1.nonzeroBitCount }
+        for mask in masks {
+            var prices = items.map(\.price)
+            var swapped: [Int] = []
+            for (bit, index) in indexes.enumerated() where mask & (1 << bit) != 0 {
+                prices[index] = round2(alternatives[index]! - (items[index].discount ?? 0))
+                swapped.append(index)
+            }
+            var fixed: Int?
+            if let u = unclear.keys.first {
+                let others = prices.enumerated().filter { $0.offset != u }.reduce(0) { $0 + $1.element }
+                let needed = round2(total - others)
+                let cents = round2(needed - needed.rounded(.down))
+                guard needed >= unclear[u]! - 0.011, abs(cents - unclear[u]!) < 0.011 else { continue }
+                prices[u] = needed
+                fixed = u
+            } else if abs(total - prices.reduce(0, +)) > 0.011 { continue }
+            var notes: [String] = []
+            for index in swapped {
+                notes.append(String(format: "%@: read %.2f, used %.2f so the lines add up to the total.", items[index].name, items[index].price, prices[index]))
+            }
+            if let u = fixed {
+                notes.append(String(format: "%@: only the cents (%.2f) were readable, so its price is %.2f, what the total leaves.", items[u].name, unclear[u]!, prices[u]))
+            }
+            for (i, p) in prices.enumerated() { items[i].price = p }
+            return notes
+        }
+        return []
+    }
+
     static func parse(_ ocr: OCRResult, sourceImagePath: String? = nil, joinStackedLogo: Bool = false) -> ReceiptDraft {
         let grouped = mergeSplitRows(RowGrouping.rows(ocr.lines))
-        let rowTexts = grouped.map(\.text)
+        let rowTexts = grouped.map { $0.text.replacingOccurrences(of: unclearMark, with: " (price unclear)") }
         var total: Double?, tax: Double?
         var items: [ParsedLineItem] = []
         var seenTotal = false
@@ -132,8 +203,12 @@ enum ReceiptParser {
         // only reaches a few rows so it can't swallow the real items that follow
         var discountRowsLeft = 0
 
+        var alternatives: [Int: Double] = [:]   // item index -> another reading of its price
+        var unclear: [Int: Double] = [:]        // item index -> the cents that survived of a price that didn't
+
         for (rawText, rowConfidence) in grouped {
-            let text = rawText.trimmingCharacters(in: .whitespaces)
+            let priceUnclear = rawText.contains(unclearMark)
+            let text = rawText.replacingOccurrences(of: unclearMark, with: "").trimmingCharacters(in: .whitespaces)
             if text.isEmpty || matches(text, skipKeywords) { continue }
 
             if matches(text, totalKeywords) || looksLikeTotal(text) {
@@ -144,6 +219,7 @@ enum ReceiptParser {
                 if let a = amount(in: text) { tax = a }
                 continue
             }
+            if matches(text, footerWords) { seenTotal = true; continue }
             if seenTotal { continue }   // past the total: payment details, tax table, footer - not more items
 
             // "2st*16,85" / "0,575kg*10,35Kr/kg" state a quantity; the price on the row is what's left over
@@ -201,15 +277,28 @@ enum ReceiptParser {
                 quantity = n
                 name = quantityPattern.replacingFirst(in: withoutAmount)
             }
+            // "Sallad 28 3,50": the 28 is the front of the price, not part of the name
+            if marker == nil, let split = splitPricePattern.first(in: line), let whole = split.group(1), let cents = split.group(2),
+               let alternative = Double("\(whole).\(cents)"), alternative != a {
+                alternatives[items.count] = alternative
+                name = Rx(#"\s+\d{1,4}$"#).replacingFirst(in: name)
+            }
+            if priceUnclear { unclear[items.count] = a }
             // a leading "*" on ICA marks a campaign price, not part of the name
             name = perKiloPattern.replacingAll(in: name).collapsedWhitespace.stripped(of: " -\t*·+")
             let unreadable = name.isEmpty || rowConfidence < mysteryConfidence
             items.append(ParsedLineItem(name: name.isEmpty ? line : name, price: a, quantity: quantity, tags: unreadable ? ["mystery"] : []))
         }
 
+        var repairs: [String] = []
+        if let total, !(alternatives.isEmpty && unclear.isEmpty) {
+            repairs = repairPrices(&items, total: total, alternatives: alternatives, unclear: unclear)
+        }
+        for index in unclear.keys where !repairs.contains(where: { $0.hasPrefix(items[index].name) }) { items[index].tags.append("mystery") }
+
         return ReceiptDraft(merchant: joinStackedLogo ? (originalMerchant(ocr) ?? guessMerchant(rowTexts)) : guessMerchant(rowTexts), merchantOriginal: nil, date: guessDate(rowTexts),
                             currency: guessCurrency(rowTexts), total: total, tax: tax, items: items,
                             suggestedCategory: (total == nil && items.isEmpty) ? "Mystery" : nil,
-                            ocrConfidence: ocr.averageConfidence, rawText: ocr.rawText, sourceImagePath: sourceImagePath)
+                            ocrConfidence: ocr.averageConfidence, rawText: rowTexts.joined(separator: "\n"), sourceImagePath: sourceImagePath, repairs: repairs)
     }
 }

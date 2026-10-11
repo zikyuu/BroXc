@@ -2,6 +2,8 @@ import Foundation
 import Vision
 import CoreGraphics
 import UIKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 
 /// One recognised piece of text, with its box in image pixels (origin top-left).
 struct OCRLine {
@@ -18,12 +20,14 @@ struct OCRResult {
 
 /// On-device text recognition via Apple's Vision framework: free, offline, no model to ship.
 enum VisionOCR {
-    static func recognize(_ image: CGImage, languages: [String] = ["en-US"]) async throws -> OCRResult {
+    /// `correction` is Vision's dictionary-based clean-up: it helps with words but can "fix" a price into something else,
+    /// so a second read without it often catches what the first one garbled.
+    static func recognize(_ image: CGImage, languages: [String] = ["en-US"], correction: Bool = true) async throws -> OCRResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let request = VNRecognizeTextRequest()
                 request.recognitionLevel = .accurate
-                request.usesLanguageCorrection = true
+                request.usesLanguageCorrection = correction
                 if let supported = try? request.supportedRecognitionLanguages() {
                     let wanted = languages.filter { want in supported.contains { $0.lowercased().hasPrefix(want.lowercased().prefix(2)) } }
                     let resolved = wanted.compactMap { want in supported.first { $0.lowercased() == want.lowercased() } ?? supported.first { $0.lowercased().hasPrefix(want.lowercased().prefix(2)) } }
@@ -66,6 +70,22 @@ enum RowGrouping {
             let sorted = row.sorted { $0.box.minX < $1.box.minX }
             return (sorted.map(\.text).joined(separator: " "), sorted.map(\.confidence).min() ?? 0)
         }
+    }
+}
+
+enum ImagePrep {
+    /// Bigger, greyscale and higher contrast: small or faint print (a thermal receipt) reads better this way.
+    static func enhanced(_ image: CGImage) -> CGImage? {
+        var ci = CIImage(cgImage: image)
+        if image.width < 1800 {
+            let scale = CIFilter.lanczosScaleTransform()
+            scale.inputImage = ci; scale.scale = 2; scale.aspectRatio = 1
+            ci = scale.outputImage ?? ci
+        }
+        let controls = CIFilter.colorControls()
+        controls.inputImage = ci; controls.saturation = 0; controls.contrast = 1.4; controls.brightness = 0.02
+        guard let output = controls.outputImage else { return nil }
+        return CIContext().createCGImage(output, from: output.extent)
     }
 }
 

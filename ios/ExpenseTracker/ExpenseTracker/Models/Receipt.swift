@@ -55,6 +55,15 @@ final class Receipt {
         set { statusRaw = newValue.rawValue }
     }
 
+    /// What the receipt says it totals minus what its lines add up to, in the receipt's own currency. nil when they agree
+    /// (to the cent) or when there's nothing to check. A positive number means a line was probably missed in reading;
+    /// a negative one means a price was probably misread.
+    var unexplainedAmount: Double? {
+        guard isItemised, let total, total > 0, !lineItems.isEmpty else { return nil }
+        let gap = round2(total - lineItems.reduce(0) { $0 + $1.price })
+        return abs(gap) > 0.011 ? gap : nil
+    }
+
     /// Read off a real receipt (photo or screenshot), vs. typed in by hand for a transaction with no
     /// receipt. Only an itemised receipt can be decomposed into Meat/Vegetables/etc.
     var isItemised: Bool {
