@@ -43,7 +43,8 @@ enum YouTripParser {
         func has(_ pattern: String) -> Bool { Rx(pattern, ignoreCase: true).test(text) }
         if has(#"\b(top[\s-]?up|topped up|add(ed)? money|add funds|load(ed)? (wallet|funds)|wallet load)\b"#) { return .transferOwnAccount }
         if has(#"\brefund(ed)?\b"#) { return .refund }
-        if has(#"\b(cash ?back|interest|reward|bonus)\b"#) { return .income }
+        if has(#"\bcash ?back\b"#) { return .cashback }
+        if has(#"\b(interest|reward|bonus)\b"#) { return .income }
         if has(#"\b(received from|transfer from|payment from|money from)\b"#) { return .other }
         return .expense
     }
@@ -53,6 +54,17 @@ enum YouTripParser {
     static func type(for description: String?, incoming: Bool) -> TransactionType {
         let guess = suggestedType(for: description)
         return incoming && guess == .expense ? .other : guess
+    }
+
+    private static let peerPayment = Rx(#"^(?:[A-Za-z]\s+)?To\s+(.+?)\s*\(Mobile no\.?\s*ending\s*\d*\)?\s*\d*\)?\s*(.*)$"#, ignoreCase: true)
+
+    /// A payment to a person shows as "To rayner (Mobile no. ending 5455)" with the note you wrote underneath, and a letter
+    /// in a circle instead of a logo (read as a stray "R").
+    static func splitPeerPayment(_ description: String?) -> (description: String?, payee: String?) {
+        guard let description, let m = peerPayment.first(in: description), let who = m.group(1)?.trimmingCharacters(in: .whitespaces), !who.isEmpty else { return (description, nil) }
+        var note = (m.group(2) ?? "").trimmingCharacters(in: .whitespaces)
+        while note.hasPrefix(")") { note = String(note.dropFirst()).trimmingCharacters(in: .whitespaces) }   // the closing bracket of "(Mobile no. ending ...)"
+        return ("To \(who)" + (note.isEmpty ? "" : " · \(note)"), who)
     }
 
     /// Moves the local-currency charge out of the description into its own value, so the matcher can
@@ -70,6 +82,19 @@ enum YouTripParser {
         var result: [ParsedTransaction] = []
         var currentDate: String?
         var pending: [String] = []
+        // For a payment to a person YouTrip prints the amount beside the FIRST line of a name that wraps, so the rest of the name
+        // ("5455)") and the note you wrote come AFTER the amount. They belong to that payment, not to the next one.
+        var rawOf: [Int: String] = [:]
+        var tailOf: Int?      // index of a payment still missing the end of its name
+        var noteOf: Int?      // index of a payment whose tail just arrived: the next plain line is its note
+        func rebuild(_ index: Int) {
+            guard let raw = rawOf[index] else { return }
+            let split = splitLocalCharge(raw)
+            let peer = splitPeerPayment(split.description)
+            result[index].description = peer.description
+            if result[index].payee != nil || peer.payee != nil { result[index].payee = peer.payee }
+        }
+        let newEntry = Rx(#"^\s*(?:[A-Za-z]\s+)?(?:To\s|Top\s?Up)"#, ignoreCase: true)
 
         for original in rows {
             let row = fixLocalAmount(original)
@@ -77,6 +102,22 @@ enum YouTripParser {
             let sgd = extractSGD(row)
 
             if chromePattern.test(row) { continue }
+            if sgd == nil, dateMatch == nil {
+                let plain = row.trimmingCharacters(in: .whitespaces)
+                if let index = tailOf, Rx(#"^(?:ending\s*)?\d{2,6}\)"#, ignoreCase: true).test(plain) {
+                    rawOf[index, default: ""] += " " + plain
+                    rebuild(index); tailOf = nil; noteOf = index
+                    continue
+                }
+                if let index = noteOf {
+                    noteOf = nil
+                    if !newEntry.test(plain), !anyAmount.test(plain), !skipKeywords.contains(where: { plain.lowercased().contains($0) }) {
+                        rawOf[index, default: ""] += " " + plain
+                        rebuild(index)
+                        continue
+                    }
+                }
+            }
             // a date header starts a new day: whatever text came before it (a screenshot's search bar, a clock) isn't a merchant
             if dateMatch != nil && sgd == nil { currentDate = dateMatch!.text; pending = []; continue }
 
@@ -85,17 +126,29 @@ enum YouTripParser {
                 for keyword in skipKeywords { leftover = Rx(keyword, ignoreCase: true).replacingAll(in: leftover) }
                 leftover = Rx(#"[*•™®©]"#).replacingAll(in: leftover)   // the SmartExchange bullet and trademark mark leave stray symbols behind
                 leftover = leftover.collapsedWhitespace.stripped(of: " -,$\t")
+                // what's left beside an amount is often just the icon read as a letter or symbol ("R", "s", "›"): not part of any name
+                if leftover.count <= 1 { leftover = "" }
                 if !leftover.isEmpty { pending.append(leftover) }
                 let joined = pending.joined(separator: " ").stripped(of: " -,\t")
                 let split = splitLocalCharge(joined.isEmpty ? nil : joined)
-                result.append(ParsedTransaction(date: Dates.parse(currentDate), description: split.description,
+                let peer = splitPeerPayment(split.description)
+                let incoming = incomingMark.test(row)
+                result.append(ParsedTransaction(date: Dates.parse(currentDate), description: peer.description,
                                                 amountSGD: sgd, localAmount: split.amount, localCurrency: split.currency,
-                                                transactionType: type(for: split.description, incoming: incomingMark.test(row))))
+                                                transactionType: type(for: split.description, incoming: incoming),
+                                                payee: incoming ? nil : peer.payee))
+                rawOf[result.count - 1] = split.description ?? ""
+                // "To rayner (Mobile no. ending" with no number and bracket yet: the rest comes on the next line
+                let rawText = split.description ?? ""
+                let isPeer = Rx(#"(?:^|\s)To\s.+\(Mobile no"#, ignoreCase: true).test(rawText)
+                tailOf = (isPeer && !Rx(#"ending\s*\d+\)"#, ignoreCase: true).test(rawText)) ? result.count - 1 : nil
+                noteOf = nil
                 pending = []
                 continue
             }
             if skipKeywords.contains(where: { row.lowercased().contains($0) }) { continue }
-            pending.append(row.trimmingCharacters(in: .whitespaces))
+            let line = row.trimmingCharacters(in: .whitespaces)
+            if line.count > 1 { pending.append(line) }   // a lone letter or "+" is an icon, not text
         }
         return result
     }

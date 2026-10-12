@@ -4,7 +4,8 @@ import Charts
 // MARK: - Radial spending map
 //
 //  angle  = how much was spent (approximately: every wedge gets a minimum so a small category stays tappable)
-//  radius = spend against the green reference (budget, else usual) - beyond the green line means over
+//  radius = spend against what's usual by this point in the month - past the dashed ring means ahead of usual
+//  tap    = select a slice: it grows to its budget (lighter colour to the budget edge, filled to what's spent)
 //  colour = which category, always the same one; a wedge is never recoloured to judge it
 
 struct SectorShape: Shape {
@@ -12,6 +13,12 @@ struct SectorShape: Shape {
     var outerRadius: CGFloat
     var start: Double   // radians, clockwise from +x
     var end: Double
+
+    /// So a slice can morph between months instead of jumping: its angles and radii are interpolated.
+    var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>, AnimatablePair<Double, Double>> {
+        get { AnimatablePair(AnimatablePair(innerRadius, outerRadius), AnimatablePair(start, end)) }
+        set { innerRadius = newValue.first.first; outerRadius = newValue.first.second; start = newValue.second.first; end = newValue.second.second }
+    }
 
     func path(in rect: CGRect) -> Path {
         let c = CGPoint(x: rect.midX, y: rect.midY)
@@ -37,23 +44,38 @@ struct RadialChart: View {
         let icon: String?
         let color: Color
         let actual: Double
-        let reference: Double?
-        let referenceIsBudget: Bool
         let usual: Double?
+        let budget: Double?
         let muted: Bool
         let route: Route
     }
 
     let home: HomeData
     let wedges: [Wedge]
+    /// The selected slice's id, or `RadialChart.totalID` for the centre (the whole month against the total budget).
+    @Binding var selection: String?
     @State private var appeared = false
+
+    static let totalID = "total"
+    /// Where a slice reaches when it's selected and shows its budget; everything else tops out inside this.
+    private static let budgetEdge: CGFloat = 150
+
+    /// A wedge juts out or in by spending so far against what's usual *by this point in the month*: 11 days in, a quarter of
+    /// a usual month's food is on pace, not under. A finished month compares whole to whole. Very early in the month the
+    /// scale is held up, since two days of shopping say little about the rate.
+    private var paceScale: Double {
+        guard home.isCurrent, home.elapsedFraction < 1 else { return 1 }
+        return max(home.elapsedFraction, 0.25)
+    }
 
     var body: some View {
         GeometryReader { geo in
             let size = min(geo.size.width, geo.size.height)
-            let u = size / 316                      // the design is drawn on a 316-unit square
+            let u = size / 336                      // the design is drawn on a 336-unit square (the ring reaches ~160 units at most)
             let c = CGPoint(x: size / 2, y: size / 2)
-            let rIn = 74 * u, rRef = 122 * u
+            let rIn = 68 * u, rRef = 126 * u              // a thicker band, so each slice has room for its icon and amount
+            let rBudget = Self.budgetEdge * u
+            let totalMode = selection == Self.totalID && home.budgetTotal != nil
             ZStack {
                 if wedges.isEmpty {
                     Circle().stroke(Theme.line, style: StrokeStyle(lineWidth: 22 * u, lineCap: .round, dash: [3, 9]))
@@ -69,54 +91,75 @@ struct RadialChart: View {
 
                 ForEach(Array(wedges.enumerated()), id: \.element.id) { index, wedge in
                     let a0 = starts[index] + gap / 2, a1 = starts[index] + spans[index] - gap / 2
-                    let ratio = wedge.reference.map { wedge.actual / $0 } ?? 1
-                    let outer = rIn + (rRef - rIn) * min(1.55, max(0.5, ratio))
+                    let isSelected = selection == wedge.id
+                    let ratio = wedge.usual.map { wedge.actual / ($0 * paceScale) } ?? 1
+                    let usualOuter = rIn + (rRef - rIn) * min(1.55, max(0.5, ratio))
+                    // selected with a budget: the slice is drawn on the budget's scale instead - filled to what's spent
+                    let budgetShare = wedge.budget.flatMap { $0 > 0 ? wedge.actual / $0 : nil }
+                    let showsBudget = isSelected && budgetShare != nil
+                    let outer = showsBudget ? rIn + (rBudget - rIn) * min(1, max(0.2, budgetShare ?? 0)) : usualOuter
                     let inset = 5 * u
-                    NavigationLink(value: wedge.route) {
+                    let faded = selection != nil && !isSelected
+                    // a tap (not a link) selects the slice, so a sideways swipe over the chart changes the month instead
+                    Group {
                         ZStack {
+                            if showsBudget {
+                                ZStack {
+                                    SectorShape(innerRadius: rIn + inset, outerRadius: rBudget - inset, start: a0 + 0.04, end: a1 - 0.04).fill(wedge.color)
+                                    SectorShape(innerRadius: rIn + inset, outerRadius: rBudget - inset, start: a0 + 0.04, end: a1 - 0.04)
+                                        .stroke(wedge.color, style: StrokeStyle(lineWidth: inset * 2, lineJoin: .round))
+                                }
+                                .compositingGroup().opacity(0.26)
+                                .transition(.opacity)
+                            }
                             SectorShape(innerRadius: rIn + inset, outerRadius: outer - inset, start: a0 + 0.04, end: a1 - 0.04)
                                 .fill(wedge.color)
                             SectorShape(innerRadius: rIn + inset, outerRadius: outer - inset, start: a0 + 0.04, end: a1 - 0.04)
                                 .stroke(wedge.color, style: StrokeStyle(lineWidth: inset * 2, lineJoin: .round))
-                            if wedge.referenceIsBudget, let usual = wedge.usual, let reference = wedge.reference {
-                                // where usual sits, when the reference is a budget (otherwise usual *is* the green line)
-                                let ru = rIn + (rRef - rIn) * min(1.55, max(0.5, usual / reference))
-                                Path { p in
-                                    let steps = 12
-                                    for i in 0...steps {
-                                        let t = (a0 + 0.06) + ((a1 - 0.06) - (a0 + 0.06)) * Double(i) / Double(steps)
-                                        let pt = CGPoint(x: size / 2 + ru * cos(t), y: size / 2 + ru * sin(t))
-                                        i == 0 ? p.move(to: pt) : p.addLine(to: pt)
-                                    }
-                                }.stroke(Color(hex: "3d7bff"), style: StrokeStyle(lineWidth: 3.5 * u, lineCap: .round))
-                            }
                             label(for: wedge, mid: (a0 + a1) / 2, radius: (rIn + outer) / 2 + 2 * u, center: c, wide: (a1 - a0) > 0.5, u: u)
                         }
                         .frame(width: size, height: size)
-                        .contentShape(SectorShape(innerRadius: rIn, outerRadius: outer, start: a0, end: a1))
+                        .contentShape(SectorShape(innerRadius: rIn, outerRadius: showsBudget ? rBudget : outer, start: a0, end: a1))
                     }
-                    .buttonStyle(.plain)
+                    .opacity(faded ? (totalMode ? 0.55 : 0.3) : 1)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.82), value: selection)
+                    .onTapGesture { selection = isSelected ? nil : wedge.id }
+                    .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                     .scaleEffect(appeared ? 1 : 0.8).opacity(appeared ? 1 : 0)
                     .animation(.spring(response: 0.5, dampingFraction: 0.72).delay(Double(index) * 0.045), value: appeared)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
                     .accessibilityLabel("\(wedge.name) \(Money.whole(wedge.actual))")
                 }
 
-                // the green line: where a category lands when it sits exactly on budget / usual - slightly wavy, hand-drawn
-                Path { p in
-                    for i in 0...180 {
-                        let t = Double(i) / 180 * 2 * Double.pi
-                        let r = rRef + 2.2 * u * sin(t * 22)
-                        let pt = CGPoint(x: c.x + r * cos(t), y: c.y + r * sin(t))
-                        i == 0 ? p.move(to: pt) : p.addLine(to: pt)
+                // the whole month against the total budget: a gauge around the outside, the slices stepping back
+                if totalMode, let budget = home.budgetTotal {
+                    let share = home.total / budget
+                    let mid = 157 * u, width = 14 * u
+                    ZStack {
+                        Circle().stroke(Theme.accent.opacity(0.18), lineWidth: width)
+                        Circle().trim(from: 0, to: min(max(share, 0.004), 1))
+                            .stroke(share > 1 ? (Theme.paceColors[.over] ?? Theme.accent) : Theme.accent, style: StrokeStyle(lineWidth: width))
+                            .rotationEffect(.degrees(-90))
                     }
-                    p.closeSubpath()
+                    .frame(width: mid * 2, height: mid * 2)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
                 }
-                .stroke(Color(hex: "8fe3a9"), style: StrokeStyle(lineWidth: 2.6 * u, lineJoin: .round))
-                .allowsHitTesting(false)
+
+                // the dashed ring: where a category lands when it sits exactly on its usual pace. Only once there is a usual to show.
+                if home.usualMonths > 0 {
+                    Circle()
+                        .stroke(Theme.accent.opacity(0.45), style: StrokeStyle(lineWidth: 1.2 * u, lineJoin: .round, dash: [3 * u, 5 * u]))
+                        .frame(width: rRef * 2, height: rRef * 2)
+                        .allowsHitTesting(false)
+                }
 
                 centre(u: u)
             }
             .frame(width: size, height: size)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: totalMode)
+            .contentShape(Rectangle())
+            .onTapGesture { selection = nil }
             .position(x: geo.size.width / 2, y: geo.size.height / 2)
         }
         .aspectRatio(1, contentMode: .fit)
@@ -128,12 +171,17 @@ struct RadialChart: View {
     private func label(for wedge: Wedge, mid: Double, radius: CGFloat, center: CGPoint, wide: Bool, u: CGFloat) -> some View {
         let x = center.x + radius * cos(mid), y = center.y + radius * sin(mid)
         VStack(spacing: 0) {
-            if let icon = wedge.icon, wide { Text(icon).font(.system(size: 14 * u)) }
-            Text(Money.whole(wedge.actual)).font(.system(size: 12 * u, weight: .heavy, design: .rounded)).foregroundStyle(Color(hex: "2b211a"))
+            if let icon = wedge.icon { Glyph(symbol: icon, size: (wide ? 14 : 10) * u).environment(\.colorScheme, .light) }
+            Text(Money.whole(wedge.actual)).font(.system(size: 12.5 * u, weight: .heavy, design: .rounded)).foregroundStyle(Color(hex: "2b211a"))
             if wedge.muted && wide { Text(wedge.name.uppercased()).font(.system(size: 8 * u, weight: .bold)).tracking(0.4).foregroundStyle(Color(hex: "6b5f52")) }
         }
         .position(x: x, y: y)
         .allowsHitTesting(false)
+    }
+
+    /// How the mascot looks at the pace: happy on track, worried when nearing the limit, sad over it.
+    private var paceMascot: String {
+        switch home.status { case .good: return "mascot-expr-happy"; case .watch: return "mascot-expr-concerned"; case .over: return "mascot-expr-sad"; case .neutral: return "mascot-expr-default" }
     }
 
     @ViewBuilder
@@ -148,13 +196,16 @@ struct RadialChart: View {
                     .rotationEffect(.degrees(-90))
                     .frame(width: (ring - 2 * u) * 2, height: (ring - 2 * u) * 2)
             }
-            VStack(spacing: 1) {
+            VStack(spacing: 0) {
+                Image(paceMascot).resizable().scaledToFit().frame(height: 30 * u).accessibilityHidden(true)
                 Text(home.dayLabel).font(.system(size: 11 * u, weight: .semibold, design: .rounded)).foregroundStyle(Theme.muted)
                 Text(Money.whole(home.total)).font(.system(size: 21 * u, weight: .heavy, design: .rounded)).minimumScaleFactor(0.6).lineLimit(1)
-                Text("your spending").font(.system(size: 10 * u, design: .rounded)).foregroundStyle(Theme.muted)
+                    .contentTransition(.numericText())
             }.frame(width: ring * 1.55)
         }
-        .allowsHitTesting(false)
+        .contentShape(Circle())
+        .onTapGesture { if home.budgetTotal != nil { selection = selection == Self.totalID ? nil : Self.totalID } }
+        .accessibilityAddTraits(home.budgetTotal != nil ? .isButton : [])
     }
 }
 

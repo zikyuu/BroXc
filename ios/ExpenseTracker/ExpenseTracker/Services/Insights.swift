@@ -86,8 +86,6 @@ struct HomeCategory: Identifiable {
     let budget: Double?
     let usual: Double?
     var id: String { "h\(category.persistentModelID.hashValue)" }
-    var reference: Double? { budget ?? usual }
-    var referenceIsBudget: Bool { budget != nil }
 }
 
 struct ComparedRow: Identifiable {
@@ -103,6 +101,12 @@ struct BalanceInfo {
 }
 
 struct HomeData {
+    /// What the whole month is budgeted at: the total you set, else the category budgets added up, else none.
+    var budgetTotal: Double? {
+        if let totalBudget, totalBudget > 0 { return totalBudget }
+        let sum = categories.compactMap { $0.budget }.filter { $0 > 0 }.reduce(0, +)
+        return sum > 0 ? sum : nil
+    }
     let month: MonthKey
     let isCurrent: Bool
     let previous: MonthKey?
@@ -113,6 +117,7 @@ struct HomeData {
     let elapsedDays: Int
     let daysInMonth: Int
     let total: Double
+    let totalBudget: Double?
     let categories: [HomeCategory]
     let unsorted: Double
     let untracked: Double
@@ -275,7 +280,7 @@ extension Ledger {
             let nodeCount = (count[category.persistentModelID] ?? 0) + children.reduce(0) { $0 + $1.count }
             if !children.isEmpty && ownSGD > 0 {
                 // real items sitting directly on a category that has children: the app can't place them any deeper
-                children.append(CategoryNode(category: nil, unsortedOf: category, name: "Unsorted", icon: "?", kind: .normal,
+                children.append(CategoryNode(category: nil, unsortedOf: category, name: "Other \(category.name.lowercased())", icon: "?", kind: .normal,
                                              isUnsorted: true, colorHex: category.effectiveColorHex, budget: nil,
                                              ownSGD: round2(ownSGD), totalSGD: round2(ownSGD),
                                              count: count[category.persistentModelID] ?? 0, children: []))
@@ -381,10 +386,40 @@ extension Ledger {
 
     // MARK: activity
 
-    private func entryCategory(_ group: [ItemView]) -> EntryCategory? {
+    /// The lowest category that contains all of these (Meat + Vegetables -> Cooking Ingredients), if they share one.
+    private func commonAncestor(_ categories: [Category]) -> Category? {
+        guard var path = categories.first?.pathIDs.count else { return nil }
+        guard let first = categories.first else { return nil }
+        let chain = first.pathIDs
+        path = chain.count
+        while path > 0 {
+            let id = chain[path - 1]
+            if categories.allSatisfy({ $0.pathIDs.contains(id) }) { return categories.first { $0.persistentModelID == id } ?? sequenceAncestor(first, id) }
+            path -= 1
+        }
+        return nil
+    }
+    private func sequenceAncestor(_ c: Category, _ id: PersistentIdentifier) -> Category? {
+        var node: Category? = c
+        while let n = node { if n.persistentModelID == id { return n }; node = n.parent }
+        return nil
+    }
+
+    /// The kind of visit shown on a receipt's row: the one the user set for it, else the one they set for the same store before
+    /// (as a suggestion), else whatever its lines have in common.
+    private func entryCategory(_ group: [ItemView], receipt: Receipt? = nil) -> EntryCategory? {
         let real = group
+        if let receipt {
+            if let visit = receipt.visitCategory { return EntryCategory(category: visit, confidence: .confirmed, mixed: false, distinct: 1) }
+            if let name = receipt.merchant?.lowercased(), let remembered = receipts.first(where: { $0.visitCategory != nil && $0.merchant?.lowercased() == name })?.visitCategory {
+                return EntryCategory(category: remembered, confidence: .suggested, mixed: false, distinct: 1)
+            }
+        }
         guard let top = real.max(by: { abs($0.priceSGD ?? 0) < abs($1.priceSGD ?? 0) }) else { return nil }
         let distinct = Set(real.map { $0.category?.persistentModelID })
+        if distinct.count > 1, receipt != nil, real.allSatisfy({ $0.category != nil }), let shared = commonAncestor(real.compactMap(\.category)) {
+            return EntryCategory(category: shared, confidence: top.confidence, mixed: true, distinct: distinct.count)
+        }
         return EntryCategory(category: top.category, confidence: top.confidence, mixed: distinct.count > 1, distinct: distinct.count)
     }
 
@@ -402,7 +437,7 @@ extension Ledger {
                 transaction: t, receipt: t.matchedReceipt,
                 personalSGD: round2(real.reduce(0) { $0 + ($1.personalSGD ?? 0) }),
                 othersSGD: round2(real.reduce(0) { $0 + ($1.othersSGD ?? 0) }),
-                itemCount: real.count, category: entryCategory(group), outflow: t.isOutflow))
+                itemCount: real.count, category: entryCategory(group, receipt: t.matchedReceipt), outflow: t.isOutflow))
         }
         let matched = Set(transactions.compactMap { $0.matchedReceipt?.persistentModelID })
         for receipt in receipts where !matched.contains(receipt.persistentModelID) {
@@ -417,7 +452,7 @@ extension Ledger {
                 note: nil, userNote: nil, transaction: nil, receipt: receipt,
                 personalSGD: round2(real.reduce(0) { $0 + ($1.personalSGD ?? 0) }),
                 othersSGD: round2(real.reduce(0) { $0 + ($1.othersSGD ?? 0) }),
-                itemCount: real.count, category: entryCategory(group)))
+                itemCount: real.count, category: entryCategory(group, receipt: receipt)))
         }
         entries.sort { ($0.date ?? .distantPast, $0.transaction?.createdAt ?? .distantPast) > ($1.date ?? .distantPast, $1.transaction?.createdAt ?? .distantPast) }
         return limit.map { Array(entries.prefix($0)) } ?? entries
@@ -453,7 +488,7 @@ extension Ledger {
         let month = requested ?? current
         let usual = usual(before: month)
         let (fraction, elapsedDays) = elapsed(month, today: today)
-        let monthItems = counted.filter { monthKey($0) == month && ($0.personalSGD ?? 0) > 0 }
+        let monthItems = counted.filter { monthKey($0) == month && ($0.personalSGD ?? 0) != 0 }
 
         var actual: [PersistentIdentifier?: Double] = [:]
         for item in monthItems { actual[item.rootCategoryID, default: 0] += item.personalSGD ?? 0 }
@@ -477,7 +512,8 @@ extension Ledger {
         else { projected = max(total, usual.total ?? total) }
 
         let budgets = rows.compactMap { $0.budget }
-        let referenceTotal = usual.total ?? (budgets.isEmpty ? nil : budgets.reduce(0, +))
+        // what the month is judged against: your total budget, else the category budgets added up, else your usual month
+        let referenceTotal = totalBudget ?? (budgets.isEmpty ? usual.total : budgets.reduce(0, +))
         var status = PaceStatus.neutral
         if let referenceTotal, referenceTotal > 0, projected > 0 {
             let ratio = projected / referenceTotal
@@ -511,7 +547,7 @@ extension Ledger {
             hasData: !items.isEmpty || !transactions.isEmpty,
             dayLabel: month == current ? f.string(from: today) : month.label,
             elapsedFraction: fraction, elapsedDays: elapsedDays, daysInMonth: month.daysInMonth,
-            total: round2(total), categories: rows, unsorted: round2(unsorted), untracked: round2(untracked),
+            total: round2(total), totalBudget: totalBudget, categories: rows, unsorted: round2(unsorted), untracked: round2(untracked),
             status: status, projected: round2(projected), usualTotal: usual.total.map(round2), usualMonths: usual.months,
             balance: balance, owedBack: max(0, reimbursement.outstanding),
             paceActual: paceActual, paceUsual: usual.cumulative,
@@ -521,6 +557,51 @@ extension Ledger {
             unknown: uncertain.filter { $0.confidence == .unknown }.count,
             matchesToCheck: review().matches.count,
             compared: Array(compared.prefix(4)), recent: activityFeed(limit: 5))
+    }
+
+    // MARK: trip reimbursement log
+
+    /// How a trip's shared costs stand: what you owe (costs logged by hand), what you're owed (you paid for others), the net
+    /// that should change hands, and what actually did.
+    struct TripLog {
+        var costs: [SharedCost] = []
+        var paidFor: [ItemView] = []
+        var payments: [YouTripTransaction] = []
+        var owed = 0.0          // I owe: the manual costs
+        var owedToYou = 0.0     // others' share of what you paid for
+        var net: Double { round2(owed - owedToYou) }
+        var paid = 0.0          // payments sent to people on this trip
+        /// Paid beyond what's logged, so something is missing from the list
+        var unaccounted: Double { max(0, round2(paid - max(0, net))) }
+        /// Logged, but not yet paid
+        var stillToPay: Double { max(0, round2(net - paid)) }
+        /// Payments are often rounded, so each one may be out by this much
+        var leeway: Double { 0.10 * Double(max(1, payments.count)) }
+        var balanced: Bool { (owed > 0 || paid > 0) && abs(paid - max(0, net)) <= leeway }
+        var isEmpty: Bool { costs.isEmpty && paidFor.isEmpty && payments.isEmpty }
+    }
+
+    static func tripLog(trip: Trip, items: [ItemView], sharedCosts: [SharedCost], transactions: [YouTripTransaction]) -> TripLog {
+        var log = TripLog()
+        log.costs = sharedCosts.filter { $0.trip?.persistentModelID == trip.persistentModelID }
+            .sorted { ($0.date ?? $0.createdAt) < ($1.date ?? $1.createdAt) }
+        log.paidFor = items.filter { $0.trip?.persistentModelID == trip.persistentModelID && !$0.isDeposit && ($0.othersSGD ?? 0) > 0 }
+        log.payments = transactions.filter { $0.trip?.persistentModelID == trip.persistentModelID && $0.transactionType == .expense && $0.payee != nil && $0.matchedReceipt == nil }
+            .sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+        log.owed = round2(log.costs.reduce(0) { $0 + $1.amountSGD })
+        log.owedToYou = round2(log.paidFor.reduce(0) { $0 + ($1.othersSGD ?? 0) })
+        log.paid = round2(log.payments.reduce(0) { $0 + abs($1.amountSGD ?? 0) })
+        return log
+    }
+
+    func tripLog(_ trip: Trip) -> TripLog { Ledger.tripLog(trip: trip, items: items, sharedCosts: sharedCosts, transactions: transactions) }
+
+    /// What you paid for others on a trip that's cancelled out by what you owe on the same trip: no money needs to come back for it.
+    var nettedAgainstOwed: Double {
+        round2(trips.reduce(0) { sum, trip in
+            let log = tripLog(trip)
+            return sum + min(log.owedToYou, log.owed)
+        })
     }
 
     // MARK: reimbursements
@@ -535,7 +616,8 @@ extension Ledger {
             return ReceivedEntry(id: t.uid, date: t.date, description: t.transactionDescription ?? "Payment received",
                                  amount: abs(t.reimbursementAmount ?? total), total: total, transaction: t)
         }
-        let paidTotal = round2(paid.reduce(0) { $0 + $1.othersSGD })
+        // what you fronted for others is partly cancelled by what you owe the same people's trip, with no money moving for that part
+        let paidTotal = round2(paid.reduce(0) { $0 + $1.othersSGD } - nettedAgainstOwed)
         let receivedTotal = round2(received.reduce(0) { $0 + $1.amount })
         let outstanding = round2(paidTotal - receivedTotal)
         let settled = abs(outstanding) < Self.balanceTolerance && (paidTotal > 0 || receivedTotal > 0)
@@ -569,7 +651,7 @@ extension Ledger {
     /// What's owed back if this one transaction weren't counted as a reimbursement - the number an
     /// incoming payment is checked against, so an over-payment is caught before it makes the balance negative.
     func outstanding(excluding transaction: YouTripTransaction) -> Double {
-        let paid = items.filter { !$0.isDeposit }.reduce(0) { $0 + ($1.othersSGD ?? 0) }
+        let paid = items.filter { !$0.isDeposit }.reduce(0) { $0 + ($1.othersSGD ?? 0) } - nettedAgainstOwed
         let received = transactions
             .filter { $0.transactionType == .reimbursement && $0.persistentModelID != transaction.persistentModelID }
             .reduce(0) { $0 + abs($1.reimbursementAmount ?? abs($1.amountSGD ?? 0)) }
@@ -602,6 +684,31 @@ extension Ledger {
         let all = categoryTree().totalSGD
         return TravelSummary(trips: summaries, categories: rows, total: travel,
                              shareOfSpending: all > 0 ? (travel / all * 1000).rounded() / 10 : 0)
+    }
+
+    /// What's still owed back to you on a trip: what you fronted, less what you owe the same trip (which cancels against it), less
+    /// reimbursements received for it (tagged to the trip, or arriving during it).
+    func tripStillOwed(_ trip: Trip, fronted: Double) -> Double {
+        let owed = tripLog(trip).owed
+        let start = trip.startDate?.startOfDay, end = trip.endDate?.startOfDay
+        let received = transactions.filter { $0.transactionType == .reimbursement }.filter { t in
+            if t.trip?.persistentModelID == trip.persistentModelID { return true }
+            guard let start, let end, let d = t.date else { return false }
+            return d >= start && d <= end
+        }.reduce(0) { $0 + abs($1.reimbursementAmount ?? abs($1.amountSGD ?? 0)) }
+        return max(0, round2(fronted - min(fronted, owed) - received))
+    }
+
+    /// The trip as a single node whose children are its top-level categories, so the same donut and cards used inside a category can
+    /// show a whole trip.
+    func tripRootNode(_ trip: Trip, tree: CategoryTree) -> CategoryNode {
+        var children = tree.roots.filter { $0.totalSGD > 0 }
+        if tree.unsortedSGD > 0 {
+            children.append(CategoryNode(category: nil, unsortedOf: nil, name: "Unsorted", icon: "?", kind: .normal, isUnsorted: true, colorHex: "a9a39a",
+                                         budget: nil, ownSGD: tree.unsortedSGD, totalSGD: tree.unsortedSGD, count: tree.unsortedCount, children: []))
+        }
+        return CategoryNode(category: nil, unsortedOf: nil, name: trip.name, icon: Art.trip, kind: .normal, isUnsorted: false, colorHex: "5d8df6",
+                            budget: nil, ownSGD: 0, totalSGD: tree.totalSGD, count: tree.roots.reduce(tree.unsortedCount) { $0 + $1.count }, children: children)
     }
 
     func tripDetail(_ trip: Trip) -> TripDetail {

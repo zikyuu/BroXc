@@ -40,6 +40,8 @@ final class LineItem {
     /// For a bottle deposit paid with a drink: the `uid` of that drink. The deposit is a sub-item of it and follows
     /// its category. nil for a standalone deposit and for returned-bottle credits.
     var parentUID: String?
+    /// A photo the user attached to remind themselves what this was (relative path under Documents). Optional and rare.
+    var photoPath: String?
     /// Per-item flat labels, e.g. ["food", "meats"] — "mystery" means this one line is unreadable.
     /// Kept alongside the category tree as an older, looser way to tag something; the tree is what
     /// actually drives spending breakdowns now.

@@ -3,16 +3,121 @@ import SwiftData
 
 // MARK: - small pieces
 
+/// A category's picture: one of the hand-drawn icons (`asset:cat-meat`), or an emoji the user typed.
+struct Glyph: View {
+    let symbol: String?
+    var size: CGFloat = 20
+    var body: some View {
+        if let symbol, symbol.hasPrefix("sf:") {
+            Image(systemName: String(symbol.dropFirst(3))).font(.system(size: size * 0.9, weight: .semibold)).foregroundStyle(Theme.text.opacity(0.75))
+        } else if let symbol, symbol.hasPrefix(CategoryArt.prefix) {
+            let name = String(symbol.dropFirst(CategoryArt.prefix.count))
+            if UIImage(named: name) != nil { Image(name).resizable().scaledToFit().frame(width: size * 1.15, height: size * 1.15) }
+            else { Image(systemName: "questionmark.square.dashed").font(.system(size: size * 0.9)).foregroundStyle(Theme.muted) }   // an icon that hasn't been drawn yet
+        } else {
+            Text(symbol ?? "•").font(.system(size: size))
+        }
+    }
+}
+
 struct IconTile: View {
     let symbol: String?
     var color: Color = Theme.miscColor
     var size: CGFloat = 40
     var body: some View {
-        Text(symbol ?? "•")
-            .font(.system(size: size * 0.5))
+        Glyph(symbol: symbol, size: size * 0.5)
             .frame(width: size, height: size)
             .background(color.opacity(0.28), in: RoundedRectangle(cornerRadius: size * 0.34, style: .continuous))
     }
+}
+
+/// The picture for each kind of money movement, until each gets its own drawing (these are system symbols, not emoji).
+enum Art {
+    static let reimbursement = "sf:person.2.fill"
+    static let income = "sf:banknote.fill"
+    static let refund = "sf:arrow.uturn.backward.circle.fill"
+    static let cashback = "sf:tag.fill"
+    static let transfer = "sf:arrow.left.arrow.right.circle.fill"
+    static let moneyIn = "sf:arrow.down.circle.fill"
+    static let person = "sf:person.fill"
+    static let receipt = "asset:cat-receipt"
+    static let link = "sf:link"
+    static let help = "sf:questionmark.circle.fill"
+    static let categories = "sf:square.grid.2x2.fill"
+    static let budget = "sf:chart.pie.fill"
+    static let trip = "sf:suitcase.fill"
+    static let tip = "sf:lightbulb.fill"
+    static let pant = "asset:cat-pant"
+    static let flights = "asset:cat-flights"
+    static func type(_ t: TransactionType) -> String {
+        switch t {
+        case .reimbursement: reimbursement; case .income: income; case .refund: refund; case .cashback: cashback
+        case .transferOwnAccount: transfer; case .other, .expense: moneyIn
+        }
+    }
+}
+
+/// The picture a trip uses: one of the drawn scenes. (Older trips stored an emoji here; those map to the nearest scene.)
+enum TripArt {
+    static let all: [(key: String, name: String)] = [
+        ("trip-airport", "Flight"), ("trip-castle", "Old town"), ("trip-beach", "Beach"), ("trip-snow", "Snow"), ("trip-camping", "Camping"),
+        ("trip-japan", "Japan"), ("trip-coast", "Coast"), ("trip-london", "London"), ("trip-amsterdam", "Canals"),
+    ]
+    static func key(_ stored: String?) -> String {
+        guard let stored, !stored.isEmpty else { return "trip-castle" }
+        if all.contains(where: { $0.key == stored }) { return stored }
+        switch stored {   // covers chosen before the current set, and old emoji
+        case "trip-plane", "trip-train", "✈️", "🛳️", "🚂": return "trip-airport"
+        case "trip-mountains", "🏔️", "🌲": return "trip-camping"
+        case "trip-city", "🌆": return "trip-london"
+        case "trip-exploring", "🎌", "🎡": return "trip-japan"
+        case "🏖️": return "trip-beach"
+        default: return "trip-castle"
+        }
+    }
+}
+
+/// A trip's scene as a picture, cropped to fill whatever size it's given.
+struct TripCover: View {
+    let trip: Trip
+    var radius: CGFloat = 14
+    var body: some View {
+        Color.clear.overlay { Image(TripArt.key(trip.emoji)).resizable().scaledToFill() }
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Theme.line) }
+    }
+}
+
+/// A trip's name with its little cover, for chips and rows.
+struct TripName: View {
+    let trip: Trip
+    var body: some View {
+        HStack(spacing: 6) { TripCover(trip: trip, radius: 5).frame(width: 18, height: 18); Text(trip.name) }
+    }
+}
+
+/// The big trip header: the scene with the name over it.
+struct TripBanner: View {
+    let trip: Trip
+    var height: CGFloat = 150
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.overlay { Image(TripArt.key(trip.emoji)).resizable().scaledToFill() }
+            LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .center)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(trip.name).font(.rounded(22, .bold))
+                Text(trip.dateRange).font(.rounded(13))
+            }.foregroundStyle(.white).padding(16)
+        }
+        .frame(height: height).clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+}
+
+/// The BroXc mascot in one of its expressions (`thinking`, `happy`, `sad`, ...).
+struct Mascot: View {
+    let name: String
+    var height: CGFloat = 80
+    var body: some View { Image("mascot-\(name)").resizable().scaledToFit().frame(height: height).accessibilityHidden(true) }
 }
 
 struct SectionTitle<Trailing: View>: View {
@@ -112,9 +217,11 @@ struct EmptyCard<Action: View>: View {
     let title: String
     let message: String?
     let action: Action
-    init(_ title: String, _ message: String? = nil, @ViewBuilder action: () -> Action) { self.title = title; self.message = message; self.action = action() }
+    var mascot: String? = "expr-thinking"
+    init(_ title: String, _ message: String? = nil, mascot: String? = "expr-thinking", @ViewBuilder action: () -> Action) { self.title = title; self.message = message; self.mascot = mascot; self.action = action() }
     var body: some View {
         VStack(spacing: 8) {
+            if let mascot { Mascot(name: mascot, height: 64) }
             Text(title).font(.rounded(16, .semibold)).multilineTextAlignment(.center)
             if let message { Text(message).font(.rounded(13)).foregroundStyle(Theme.muted).multilineTextAlignment(.center) }
             action
@@ -124,7 +231,7 @@ struct EmptyCard<Action: View>: View {
     }
 }
 extension EmptyCard where Action == EmptyView {
-    init(_ title: String, _ message: String? = nil) { self.init(title, message) { EmptyView() } }
+    init(_ title: String, _ message: String? = nil, mascot: String? = "expr-thinking") { self.init(title, message, mascot: mascot) { EmptyView() } }
 }
 
 struct PrimaryButton: View {
@@ -135,7 +242,7 @@ struct PrimaryButton: View {
     var body: some View {
         Button(action: action) {
             Text(title).font(.rounded(16, .semibold)).frame(maxWidth: .infinity).padding(.vertical, 14)
-                .foregroundStyle(.white)
+                .foregroundStyle(Theme.onAccent)
                 .background(tint.opacity(disabled ? 0.4 : 1), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .disabled(disabled)
@@ -202,15 +309,16 @@ struct TransactionRow: View {
     let entry: ActivityEntry
     var showDate = false
 
-    private static let incomingIcon: [TransactionType: String] = [.reimbursement: "🤝", .income: "💰", .refund: "↩️",
-                                                                   .transferOwnAccount: "🔁", .other: "⬇️"]
-    static let incomingLabel: [TransactionType: String] = [.reimbursement: "Reimbursement", .income: "Income",
+    private static let incomingIcon: [TransactionType: String] = [.reimbursement: Art.reimbursement, .income: Art.income, .refund: Art.refund, .cashback: Art.cashback,
+                                                                   .transferOwnAccount: Art.transfer, .other: Art.moneyIn]
+    static let incomingLabel: [TransactionType: String] = [.reimbursement: "Reimbursement", .income: "Income", .cashback: "Cashback",
                                                            .refund: "Refund", .transferOwnAccount: "Own account transfer", .other: "Money in"]
 
     private var subtitle: String {
         var parts: [String] = []
         if showDate, let date = entry.date { parts.append(date.formatted(.dateTime.day().month(.abbreviated))) }
         if entry.isIncoming { parts.append(entry.outflow && entry.type == .transferOwnAccount ? "Transfer out" : (entry.transaction?.incomeLabel ?? Self.incomingLabel[entry.type] ?? "Money in")) }
+        else if let payee = entry.transaction?.payee { parts.append("Paid to \(payee)") }
         else if entry.status == "receipt_only" { parts.append("Receipt · no charge linked yet") }
         else if let c = entry.category, c.mixed { parts.append("\(c.distinct) categories") }
         else if let c = entry.category?.category {
@@ -224,10 +332,10 @@ struct TransactionRow: View {
     var body: some View {
         let split = entry.othersSGD > 0.005
         HStack(spacing: 12) {
-            if entry.isIncoming { IconTile(symbol: Self.incomingIcon[entry.type] ?? "⬇️", color: Theme.good) }
+            if entry.isIncoming { IconTile(symbol: Self.incomingIcon[entry.type] ?? Art.moneyIn, color: Theme.good) }
             else {
                 let cat = entry.category?.category
-                IconTile(symbol: cat?.icon ?? (entry.kind == .receipt ? "🧾" : "•"), color: cat.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor)
+                IconTile(symbol: cat?.icon ?? (entry.transaction?.payee != nil ? Art.person : Art.receipt), color: cat.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor)
                     .opacity(entry.category?.confidence == .suggested ? 0.45 : 1)
             }
             VStack(alignment: .leading, spacing: 3) {
@@ -237,7 +345,7 @@ struct TransactionRow: View {
                     HStack(spacing: 5) {
                         if let trip = entry.trip { MiniChip(text: trip.name, style: .trip) }
                         if entry.status == "needs_review" { MiniChip(text: "check match", style: .warn) }
-                        if entry.status == "unmatched" { MiniChip(text: "no receipt", style: .quiet) }
+                        if entry.status == "unmatched" { MiniChip(text: entry.transaction?.payee != nil ? "not itemised" : "no receipt", style: .quiet) }
                         if entry.matchedReceipt?.unexplainedAmount != nil { MiniChip(text: "items don’t add up", style: .warn) }
                         if !entry.isIncoming, entry.category?.confidence == .suggested { MiniChip(text: "guessed", style: .quiet) }
                     }.lineLimit(1)
@@ -307,6 +415,9 @@ enum Route: Hashable {
     case search, trends, review, balance, categories, add, more
     case account(Account)
     case accounts
+    case help
+    case reimbursementLog(Trip)
+    case budgets
 }
 
 /// Reads everything the engine needs and hands screens a fresh `Ledger`. SwiftData re-renders this when
@@ -320,10 +431,12 @@ struct WithLedger<Content: View>: View {
     @Query private var checkpoints: [BalanceCheckpoint]
     @Query private var rules: [ItemRule]
     @Query private var accounts: [BankAccount]
+    @Query private var sharedCosts: [SharedCost]
+    @AppStorage("totalBudget") private var totalBudget = 0.0
     @ViewBuilder let content: (Ledger) -> Content
     var body: some View {
         content(Ledger(receipts: receipts, transactions: transactions, categories: categories, trips: trips,
-                       reconciliations: reconciliations, checkpoints: checkpoints, rules: rules, accounts: accounts))
+                       reconciliations: reconciliations, checkpoints: checkpoints, rules: rules, accounts: accounts, sharedCosts: sharedCosts, totalBudget: totalBudget))
     }
 }
 
@@ -342,6 +455,11 @@ struct Screen<Content: View>: View {
 }
 
 /// A brief message at the top of the screen, for "Moved 2 items to Meat"-style feedback.
+/// "Recategorised to Meat" / "3 items recategorised to Meat".
+func recategorisedMessage(_ count: Int, to name: String?) -> String {
+    count == 1 ? "Recategorised to \(name ?? "Unsorted")" : "\(count) items recategorised to \(name ?? "Unsorted")"
+}
+
 @MainActor @Observable
 final class Toaster {
     var message: String?
@@ -359,9 +477,9 @@ struct ToastOverlay: View {
     var body: some View {
         VStack {
             if let message = toaster.message {
-                Text(message).font(.rounded(14, .semibold)).foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(toaster.isError ? Theme.bad : Color.black.opacity(0.85), in: Capsule())
+                Text(message).font(.rounded(12, .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(toaster.isError ? Theme.bad.opacity(0.9) : Color.black.opacity(0.55), in: Capsule())
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             Spacer()

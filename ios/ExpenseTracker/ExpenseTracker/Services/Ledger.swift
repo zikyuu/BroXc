@@ -72,6 +72,9 @@ struct ItemView: Identifiable {
     /// For a bottle deposit paid with a product: that product's item id.
     var parentID: String? = nil
 
+    /// Set for a cost someone else paid that you owe your share of (a `SharedCost`).
+    var sharedCostID: String? = nil
+
     var isVirtual: Bool { lineItem == nil }
     var rootCategoryID: PersistentIdentifier? { category?.root.persistentModelID }
     var estimated: Bool { sgdSource == .estimated }
@@ -88,6 +91,9 @@ struct Ledger {
     let categories: [Category]
     let trips: [Trip]
     let accounts: [AccountInfo]
+    let sharedCosts: [SharedCost]
+    /// A monthly budget for everything, in SGD (nil when not set).
+    let totalBudget: Double?
     let reconciliations: [BalanceReconciliation]
     let checkpoints: [BalanceCheckpoint]
     let rules: [ItemRule]
@@ -96,7 +102,9 @@ struct Ledger {
 
     init(receipts: [Receipt], transactions: [YouTripTransaction], categories: [Category], trips: [Trip],
          reconciliations: [BalanceReconciliation] = [], checkpoints: [BalanceCheckpoint] = [],
-         rules: [ItemRule] = [], accounts accountModels: [BankAccount] = []) {
+         rules: [ItemRule] = [], accounts accountModels: [BankAccount] = [], sharedCosts: [SharedCost] = [], totalBudget: Double? = nil) {
+        self.totalBudget = (totalBudget ?? 0) > 0 ? totalBudget : nil
+        self.sharedCosts = sharedCosts
         self.accounts = accountModels.isEmpty ? AccountInfo.defaults : accountModels.sorted { $0.sortOrder < $1.sortOrder }.map(AccountInfo.init)
         self.receipts = receipts
         self.transactions = transactions
@@ -108,7 +116,8 @@ struct Ledger {
         let lookup = CategoryLookup(categories)
         self.lookup = lookup
         let learned = Dictionary(rules.compactMap { r in r.category.map { (r.name, $0) } }, uniquingKeysWith: { first, _ in first })
-        self.items = Ledger.buildItems(receipts: receipts, transactions: transactions, lookup: lookup, learned: learned, depositCategory: categories.first { $0.kind == .deposit })
+        self.items = Ledger.buildItems(receipts: receipts, transactions: transactions, sharedCosts: sharedCosts, lookup: lookup, learned: learned,
+                                       depositCategory: categories.first { $0.kind == .deposit }, groceryCategory: categories.first { $0.kind == .grocery })
     }
 
     /// A fresh ledger over everything currently stored.
@@ -117,7 +126,7 @@ struct Ledger {
         func all<T: PersistentModel>(_ type: T.Type) -> [T] { (try? context.fetch(FetchDescriptor<T>())) ?? [] }
         return Ledger(receipts: all(Receipt.self), transactions: all(YouTripTransaction.self), categories: all(Category.self),
                       trips: all(Trip.self), reconciliations: all(BalanceReconciliation.self),
-                      checkpoints: all(BalanceCheckpoint.self), rules: all(ItemRule.self), accounts: all(BankAccount.self))
+                      checkpoints: all(BalanceCheckpoint.self), rules: all(ItemRule.self), accounts: all(BankAccount.self), sharedCosts: all(SharedCost.self))
     }
 
     /// How to show an account, even one that's since been deleted.
@@ -144,8 +153,8 @@ struct Ledger {
         }
     }
 
-    private static func buildItems(receipts: [Receipt], transactions: [YouTripTransaction],
-                                   lookup: CategoryLookup, learned: [String: Category], depositCategory: Category?) -> [ItemView] {
+    private static func buildItems(receipts: [Receipt], transactions: [YouTripTransaction], sharedCosts: [SharedCost],
+                                   lookup: CategoryLookup, learned: [String: Category], depositCategory: Category?, groceryCategory: Category?) -> [ItemView] {
         let reference = referenceRates(transactions)
         var transactionForReceipt: [PersistentIdentifier: YouTripTransaction] = [:]
         for t in transactions { if let r = t.matchedReceipt { transactionForReceipt[r.persistentModelID] = t } }
@@ -187,7 +196,7 @@ struct Ledger {
         func broadened(_ category: Category) -> Category {
             var node: Category? = category
             while let current = node {
-                if let grocery = current.children.first(where: { $0.kind == .grocery }) { return grocery }
+                if current.isGroceryParent, let grocery = groceryCategory { return grocery }
                 node = current.parent
             }
             return category
@@ -201,7 +210,7 @@ struct Ledger {
             if category == nil, let remembered = learned[ItemRule.key(original ?? name)] ?? learned[ItemRule.key(name)] { category = remembered; confidence = .suggested }
             if category == nil, let guess = lookup.infer(from: tags) { category = guess; confidence = .suggested }
             // a known grocery spend with no receipt can't be split into meat/veg/etc until one turns up
-            if let found = category, !itemised, let grocery = found.children.first(where: { $0.kind == .grocery }) {
+            if let found = category, !itemised, found.isGroceryParent, let grocery = groceryCategory {
                 category = grocery
             }
             return (category, confidence)
@@ -239,7 +248,19 @@ struct Ledger {
 
         // expense charges with no receipt at all get no line item to read from - without this that
         // money is invisible in every total. Reimbursements/income/transfers aren't purchases.
+        // cashback lowers spending: a negative line the user can file under the category it came back from
+        for t in transactions where t.transactionType == .cashback && t.matchedReceipt == nil {
+            let amount = -abs(t.amountSGD ?? 0)
+            result.append(ItemView(
+                id: "txn-" + t.uid, lineItem: nil, transaction: t, receipt: nil,
+                name: t.transactionDescription ?? "Cashback", quantity: 1, isDeposit: false,
+                price: amount, currency: "SGD", priceSGD: amount, personalPrice: amount, personalSGD: amount,
+                othersSGD: 0, sgdSource: .native, splitMode: .mine, splitUnresolved: false, tags: [],
+                category: nil, confidence: .unknown, trip: t.trip, matchStatus: nil, date: t.date, merchant: "Cashback", itemised: false))
+        }
         for t in transactions where t.transactionType == .expense && t.matchedReceipt == nil {
+            // a payment to a person during a trip is a settlement of the trip's reimbursement log, not spending of its own
+            if t.payee != nil, t.trip != nil { continue }
             let amount = t.amountSGD ?? 0
             var guess: Category?
             var guessedFrom: String?
@@ -262,6 +283,36 @@ struct Ledger {
                 category: finalCategory, confidence: guess != nil ? .suggested : confidence, trip: t.trip,
                 matchStatus: nil, date: t.date, merchant: "No receipt yet", itemised: false)
             if guess != nil, let guessedFrom { view.suggestionNote = "Guessed from your past purchases at \(guessedFrom): there’s no receipt for this one, so it may not be the same kind of spend." }
+            result.append(view)
+        }
+
+        // what you owe for things others paid: your spending from the day it happened
+        for c in sharedCosts {
+            let date = c.date ?? c.trip?.endDate ?? c.trip?.startDate ?? c.createdAt
+            var view = ItemView(
+                id: "owe-" + c.uid, lineItem: nil, transaction: nil, receipt: nil, name: c.title, quantity: 1, isDeposit: false,
+                price: c.amountSGD, currency: "SGD", priceSGD: c.amountSGD, personalPrice: c.amountSGD, personalSGD: c.amountSGD,
+                othersSGD: 0, sgdSource: .native, splitMode: .mine, splitUnresolved: false, tags: [],
+                category: c.category, confidence: c.category == nil ? .unknown : .confirmed, trip: c.trip,
+                matchStatus: nil, date: date, merchant: c.person.map { "owed to \($0)" } ?? "shared cost", itemised: false)
+            view.sharedCostID = c.uid
+            result.append(view)
+        }
+        // payments to people on a trip that the logged costs don't explain yet stay visible as unsorted spending
+        let tripsWithPayments = Dictionary(grouping: transactions.filter { $0.transactionType == .expense && $0.payee != nil && $0.matchedReceipt == nil && $0.trip != nil },
+                                           by: { $0.trip!.persistentModelID })
+        for (_, payments) in tripsWithPayments {
+            let trip = payments[0].trip!
+            let log = Ledger.tripLog(trip: trip, items: result, sharedCosts: sharedCosts, transactions: transactions)
+            guard log.unaccounted > balanceTolerance else { continue }
+            let last = payments.max { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }!
+            var view = ItemView(
+                id: "unacc-\(trip.persistentModelID.hashValue)", lineItem: nil, transaction: last, receipt: nil,
+                name: "Unaccounted reimbursement", quantity: 1, isDeposit: false, price: log.unaccounted, currency: "SGD",
+                priceSGD: log.unaccounted, personalPrice: log.unaccounted, personalSGD: log.unaccounted, othersSGD: 0, sgdSource: .native,
+                splitMode: .mine, splitUnresolved: false, tags: [], category: nil, confidence: .unknown, trip: trip, matchStatus: nil,
+                date: last.date, merchant: "paid to people", itemised: false)
+            view.suggestionNote = "You paid more than the costs you've logged. Log the rest, or leave it here."
             result.append(view)
         }
         return result

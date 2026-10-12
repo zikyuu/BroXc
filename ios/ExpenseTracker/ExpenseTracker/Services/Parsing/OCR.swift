@@ -99,6 +99,29 @@ enum ImageLoader {
         return renderer.image { _ in image.draw(at: .zero) }.cgImage
     }
 
+    /// A photo attached to an item: scaled down and saved as a JPEG so a few dozen of them stay small.
+    static func storePhoto(_ image: UIImage, maxDimension: CGFloat = 1600) -> String? {
+        let longest = max(image.size.width, image.size.height)
+        let scale = longest > maxDimension ? maxDimension / longest : 1
+        let target = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let resized = UIGraphicsImageRenderer(size: target).image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
+        guard let jpeg = resized.jpegData(compressionQuality: 0.8) else { return nil }
+        let directory = URL.documentsDirectory.appending(path: "uploads", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appending(path: UUID().uuidString + ".jpg")
+        return (try? jpeg.write(to: url)) != nil ? "uploads/" + url.lastPathComponent : nil
+    }
+
+    static func load(_ path: String?) -> UIImage? {
+        guard let path, !path.isEmpty else { return nil }
+        return UIImage(contentsOfFile: URL.documentsDirectory.appending(path: path).path)
+    }
+
+    static func delete(_ path: String?) {
+        guard let path, !path.isEmpty else { return }
+        try? FileManager.default.removeItem(at: URL.documentsDirectory.appending(path: path))
+    }
+
     /// Keeps the uploaded image on disk so a receipt's source path stays valid.
     static func store(_ data: Data) -> String? {
         let directory = URL.documentsDirectory.appending(path: "uploads", directoryHint: .isDirectory)

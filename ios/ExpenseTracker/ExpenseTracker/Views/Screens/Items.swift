@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import PhotosUI
 
 // MARK: - Item rows
 
@@ -12,6 +13,13 @@ enum ItemFormat {
 
 struct ItemRow: View {
     let item: ItemView
+
+    /// "paid to Nicha" for a line that belongs to a payment sent from DBS or PayLah.
+    private func paidTo(_ item: ItemView) -> String? {
+        guard let t = item.transaction, t.isOutflow, t.transactionType == .expense, t.account != .youtrip else { return nil }
+        let who = (t.transactionDescription ?? "").replacingOccurrences(of: "PayNow to ", with: "")
+        return "paid to \(who)"
+    }
     /// Bottle deposits paid with this item, shown as small lines under it.
     var children: [ItemView] = []
     var selecting = false
@@ -27,15 +35,19 @@ struct ItemRow: View {
             Text(item.date.map { $0.formatted(.dateTime.day().month(.abbreviated)) } ?? "")
                 .font(.rounded(11, .bold)).foregroundStyle(Theme.muted).frame(width: 42, alignment: .leading).padding(.top, 2)
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.name + ((item.quantity ?? 1) != 1 ? " ×\(item.quantity!.formatted())" : "")).font(.rounded(15, .semibold))
+                (Text(item.name + ((item.quantity ?? 1) != 1 ? " ×\(item.quantity!.formatted())" : "")) + (item.lineItem?.photoPath != nil ? Text("  ") + Text(Image(systemName: "camera.fill")).font(.system(size: 12)).foregroundColor(Theme.muted) : Text(""))).font(.rounded(15, .semibold))
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 5) {
-                    Text(item.isVirtual ? "no receipt" : (item.merchant ?? "Unknown store")).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                    Text(item.sharedCostID != nil ? (item.merchant ?? "") : (item.isVirtual ? "no receipt" : (item.merchant ?? "Unknown store"))).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
                     if item.splitMode != .mine { MiniChip(text: (item.othersSGD ?? 0) > 0 ? "paid \(Money.whole(item.othersSGD ?? 0)) for others" : "paid for others", style: .paid) }
                     if let trip = item.trip { MiniChip(text: trip.name, style: .trip) }
                 }
+                if let paid = paidTo(item) {
+                    // money sent to someone (PayNow / PayLah): the lines came from a breakdown of that payment, and tapping opens it
+                    Label(paid, systemImage: "arrow.up.right").font(.rounded(10)).foregroundStyle(Theme.muted).lineLimit(1)
+                }
                 ForEach(children) { child in
-                    Text("♻️ \(child.name) · \(ItemFormat.amount(child).text)").font(.rounded(12)).foregroundStyle(Theme.muted)
+                    HStack(spacing: 4) { Glyph(symbol: Art.pant, size: 11); Text("\(child.name) · \(ItemFormat.amount(child).text)") }.font(.rounded(12)).foregroundStyle(Theme.muted)
                 }
             }
             Spacer(minLength: 6)
@@ -107,6 +119,7 @@ struct ItemSelectionBar: ViewModifier {
     @Environment(\.modelContext) private var context
     @Environment(Toaster.self) private var toaster
     @State private var picking = false
+    @State private var confirmDelete = false
 
     func body(content: Content) -> some View {
         content
@@ -118,16 +131,24 @@ struct ItemSelectionBar: ViewModifier {
                         if !allIDs.isEmpty {
                             Button(selected.count == allIDs.count ? "None" : "All") { selected = selected.count == allIDs.count ? [] : Set(allIDs) }.buttonStyle(.bordered)
                         }
+                        Button { confirmDelete = true } label: { Image(systemName: "trash") }.buttonStyle(.bordered).tint(Theme.bad)
+                            .disabled(selected.isEmpty || !ledger.items.contains { selected.contains($0.id) && $0.lineItem != nil })
                         Button("Move to…") { picking = true }.buttonStyle(.borderedProminent).disabled(selected.isEmpty)
                     }
                     .padding(.horizontal, 16).padding(.vertical, 12).background(.regularMaterial)
                 }
             }
+            .confirmationDialog("Delete the selected lines?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    let n = Actions.deleteLines(ledger.items.filter { selected.contains($0.id) }, in: context)
+                    toaster.show("Deleted \(n) line\(n == 1 ? "" : "s")"); selecting = false; selected = []
+                }
+            } message: { Text("Only lines read from a receipt can be deleted. A charge with no receipt stays.") }
             .sheet(isPresented: $picking) {
                 CategoryPicker(title: "Move to…", teach: true) { category, remember, similar in
                     let moving = ledger.items.filter { selected.contains($0.id) }
                     Actions.assignCategory(moving, to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
-                    toaster.show("Moved \(moving.count) item\(moving.count == 1 ? "" : "s") to \(category?.name ?? "Unsorted")")
+                    toaster.show(recategorisedMessage(moving.count, to: category?.name))
                     selecting = false; selected = []
                 }
             }
@@ -154,7 +175,7 @@ struct CategoryDrop: ViewModifier {
             let moving = ledger.items.filter { ids.contains($0.id) }
             guard !moving.isEmpty else { return false }
             Actions.assignCategory(moving, to: category, ledger: ledger, in: context)
-            toaster.show("Moved \(moving.count) item\(moving.count == 1 ? "" : "s") to \(category?.name ?? "Unsorted")")
+            toaster.show(recategorisedMessage(moving.count, to: category?.name))
             return true
         } isTargeted: { targeted = $0 }
     }
@@ -170,11 +191,21 @@ struct ItemSheet: View {
     @State private var pickingCategory = false
     @State private var pickingTrip = false
     @State private var renaming = false
+    @State private var editingPrice = false
+    @State private var priceText = ""
+    @State private var confirmDelete = false
+    @State private var photoPick: PhotosPickerItem?
+    @State private var takingPhoto = false
+    @State private var viewingPhoto = false
 
     var body: some View {
         WithLedger { ledger in
             if let item = ledger.items.first(where: { $0.id == itemID }) { sheet(item, ledger) }
-            else { Text("This item no longer exists.").foregroundStyle(Theme.muted).padding() }
+            else {
+                // the item was moved or removed while this was open (a drag recategorises it, which can give it a new id):
+                // there's nothing to show, so close rather than leave a blank sheet
+                Color.clear.onAppear { dismiss() }
+            }
         }
     }
 
@@ -204,18 +235,32 @@ struct ItemSheet: View {
                         Button { pickingCategory = true } label: {
                             MenuRow("Category") { CategoryChip(category: item.category, confidence: item.confidence, full: true) }
                         }.buttonStyle(.plain)
+                        if item.sharedCostID == nil && !item.id.hasPrefix("unacc-") { photoRow(item) }
+                        if item.lineItem != nil {
+                            Button { priceText = String(format: "%.2f", item.price); editingPrice = true } label: {
+                                MenuRow("Price", hint: "Fix it if the receipt was read wrong") { Text("\(item.currency ?? "SGD") \(String(format: "%.2f", item.price))").font(.rounded(14)).foregroundStyle(Theme.muted) }
+                            }.buttonStyle(.plain)
+                        }
                         if item.confidence == .suggested, let category = item.category {
                             Button {
                                 Actions.acceptSuggestions([item], ledger: ledger, in: context); toaster.show("Confirmed"); dismiss()
                             } label: { MenuRow("Yes, it’s \(category.name)", chevron: false) { Image(systemName: "checkmark").foregroundStyle(Theme.accent) }.foregroundStyle(Theme.accent) }
                                 .buttonStyle(.plain)
                         }
-                        Button { pickingTrip = true } label: { MenuRow("Trip") { Text(item.trip?.name ?? "None").font(.rounded(14)).foregroundStyle(Theme.muted) } }.buttonStyle(.plain)
+                        if item.sharedCostID == nil && !item.id.hasPrefix("unacc-") {
+                            Button { pickingTrip = true } label: { MenuRow("Trip") { Text(item.trip?.name ?? "None").font(.rounded(14)).foregroundStyle(Theme.muted) } }.buttonStyle(.plain)
+                        }
+                        if let trip = item.trip, item.sharedCostID != nil || item.id.hasPrefix("unacc-") {
+                            NavigationLink(value: Route.reimbursementLog(trip)) { MenuRow("Open the reimbursement log", hint: "Edit or delete this cost there") }.buttonStyle(.plain)
+                        }
                         if let t = item.transaction {
                             NavigationLink(value: Route.split(t)) { MenuRow("Split / paid for others") }.buttonStyle(.plain)
                             NavigationLink(value: Route.transaction(t)) { MenuRow("Open transaction") }.buttonStyle(.plain)
                         } else if let r = item.receipt {
                             NavigationLink(value: Route.receipt(r)) { MenuRow("Open receipt") }.buttonStyle(.plain)
+                        }
+                        if item.lineItem != nil {
+                            Button { confirmDelete = true } label: { MenuRow("Delete this line", hint: "A line the receipt read twice, or that isn’t really there", chevron: false).foregroundStyle(Theme.bad) }.buttonStyle(.plain)
                         }
                     }.flushCard()
                 }
@@ -229,9 +274,34 @@ struct ItemSheet: View {
         .sheet(isPresented: $pickingCategory) {
             CategoryPicker(selected: item.category, allowClear: true, teach: true) { category, remember, similar in
                 Actions.assignCategory([item], to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
-                toaster.show(category.map { "Moved to \($0.name)" } ?? "Cleared")
+                toaster.show(category.map { "Recategorised to \($0.name)" } ?? "Cleared")
             }
         }
+        .alert("Price", isPresented: $editingPrice) {
+            TextField("0.00", text: $priceText).keyboardType(.decimalPad)
+            Button("Save") {
+                if let value = Double(priceText.replacingOccurrences(of: ",", with: ".")) {
+                    do { try Actions.setLinePrice(item, to: value, in: context); toaster.show("Price updated") } catch { toaster.show(error.localizedDescription, error: true) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("In the receipt's own currency (\(item.currency ?? "SGD")).") }
+        .confirmationDialog("Delete “\(item.name)”?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete this line", role: .destructive) { Actions.deleteLines([item], in: context); toaster.show("Deleted"); dismiss() }
+        } message: { Text("Use this for a line the receipt read twice, or that isn’t on it. The receipt’s total stays as printed.") }
+        .onChange(of: photoPick) { _, picked in
+            guard let picked else { return }
+            Task {
+                defer { photoPick = nil }
+                if let data = try? await picked.loadTransferable(type: Data.self), let image = UIImage(data: data) {
+                    Actions.setPhoto(image, on: item, in: context); toaster.show("Photo added")
+                }
+            }
+        }
+        .fullScreenCover(isPresented: $takingPhoto) {
+            CameraPicker { image in Actions.setPhoto(image, on: item, in: context); toaster.show("Photo added") }.ignoresSafeArea()
+        }
+        .sheet(isPresented: $viewingPhoto) { if let image = ImageLoader.load(item.lineItem?.photoPath) { PhotoViewer(image: image) } }
         .sheet(isPresented: $renaming) {
             RenameSheet(current: item.name, printed: item.lineItem?.originalName ?? item.name) { name, remember in
                 do { try Actions.rename(item, to: name, remember: remember, in: context); toaster.show(remember ? "Renamed. It will use this name next time too" : "Renamed") }
@@ -279,6 +349,35 @@ struct RenameSheet: View {
     }
 }
 
+extension ItemSheet {
+    /// A photo to remember what exactly this was: a magnet bought somewhere, say. Optional, and most items never have one.
+    @ViewBuilder
+    fileprivate func photoRow(_ item: ItemView) -> some View {
+        if let image = ImageLoader.load(item.lineItem?.photoPath) {
+            HStack(spacing: 12) {
+                Button { viewingPhoto = true } label: {
+                    Image(uiImage: image).resizable().scaledToFill().frame(width: 64, height: 64).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }.buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Photo").font(.rounded(15))
+                    Text("Tap to enlarge").font(.rounded(12)).foregroundStyle(Theme.muted)
+                }
+                Spacer()
+                Menu {
+                    if CameraPicker.isAvailable { Button("Take a new photo", systemImage: "camera") { takingPhoto = true } }
+                    PhotosPicker("Choose another", selection: $photoPick, matching: .images)
+                    Button("Remove photo", systemImage: "trash", role: .destructive) { Actions.setPhoto(nil, on: item, in: context) }
+                } label: { Image(systemName: "ellipsis.circle").font(.system(size: 20)).foregroundStyle(Theme.muted) }
+            }.padding(.horizontal, 16).padding(.vertical, 10).rowDivider()
+        } else {
+            Menu {
+                if CameraPicker.isAvailable { Button("Take a photo", systemImage: "camera") { takingPhoto = true } }
+                PhotosPicker("Choose from photos", selection: $photoPick, matching: .images)
+            } label: { MenuRow("Photo", hint: "Add one to remember what exactly this was") { Image(systemName: "camera").foregroundStyle(Theme.muted) } }
+        }
+    }
+}
+
 // MARK: - Pickers
 
 struct TripPicker: View {
@@ -294,7 +393,7 @@ struct TripPicker: View {
                     Button { onPick(nil); dismiss() } label: { MenuRow("No trip", chevron: false) { if current == nil { Image(systemName: "checkmark") } } }.buttonStyle(.plain)
                     ForEach(trips) { trip in
                         Button { onPick(trip); dismiss() } label: {
-                            MenuRow("\(trip.emoji ?? "🧳") \(trip.name)", chevron: false) { if current?.persistentModelID == trip.persistentModelID { Image(systemName: "checkmark") } }
+                            MenuRow(trip.name, chevron: false) { if current?.persistentModelID == trip.persistentModelID { Image(systemName: "checkmark") } }
                         }.buttonStyle(.plain)
                     }
                 }.flushCard().padding(16)
@@ -413,14 +512,12 @@ struct CategoryEditSheet: View {
     @Environment(Toaster.self) private var toaster
     @State private var name = ""
     @State private var icon = ""
-    @State private var budget = ""
     @State private var colorHex: String?
     @State private var confirmDelete = false
     var onDeleted: (() -> Void)?
     /// Called with the new category after it's been created.
     var onCreated: ((Category) -> Void)?
 
-    private static let emoji = ["🍴", "🛒", "🚆", "🛏️", "🎟️", "🛍️", "🎁", "🏠", "💊", "☕", "🍜", "🎮", "📚", "💼", "✈️", "🐶", "🎬", "💇", "📱", "🧾"]
     private static let swatches = Category.palette.map { String($0.dropFirst()) }
     private var topLevel: Bool { category == nil ? parent == nil : category!.parent == nil }
     private var parentName: String { (category?.parent ?? parent)?.name ?? "its parent" }
@@ -429,25 +526,41 @@ struct CategoryEditSheet: View {
         NavigationStack {
             Form {
                 Section("Name") { TextField("Category name", text: $name) }
-                Section("Icon") {
-                    TextField("🙂", text: $icon).font(.system(size: 28))
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack { ForEach(Self.emoji, id: \.self) { e in Button(e) { icon = e }.font(.system(size: 26)).buttonStyle(.borderless) } }
+Section("Icon") {
+                    HStack(spacing: 12) {
+                        Glyph(symbol: icon.isEmpty ? nil : icon, size: 30).frame(width: 48, height: 48)
+                            .background(Color(hex: colorHex ?? (category?.effectiveColorHex ?? parent?.effectiveColorHex ?? Category.fallbackColorHex)).opacity(0.28), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        TextField("or type an emoji", text: Binding(get: { icon.hasPrefix(CategoryArt.prefix) ? "" : icon }, set: { icon = $0 })).font(.system(size: 22))
+                    }
+                    ForEach(CategoryArt.picker, id: \.group) { group in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(group.group).font(.rounded(11, .semibold)).foregroundStyle(Theme.muted)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 10) {
+                                    ForEach(group.slugs, id: \.self) { slug in
+                                        Button { icon = CategoryArt.symbol(slug: slug) } label: {
+                                            Glyph(symbol: CategoryArt.symbol(slug: slug), size: 26).frame(width: 46, height: 46)
+                                                .background(icon == CategoryArt.symbol(slug: slug) ? Theme.accentSoft : Color.clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        }.buttonStyle(.borderless)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Section {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 7), spacing: 12) {
                         ForEach(Self.swatches, id: \.self) { hex in
                             Circle().fill(Color(hex: hex)).frame(width: 28, height: 28)
-                                .overlay { if colorHex?.lowercased().hasSuffix(hex) == true { Circle().stroke(Theme.text, lineWidth: 3) } }
+                                .overlay { if colorHex?.lowercased().hasSuffix(hex.lowercased()) == true { Circle().stroke(Theme.text, lineWidth: 3) } }
                                 .onTapGesture { colorHex = "#" + hex }
                         }
                     }
+                    ColorPicker("Any other colour", selection: Binding(
+                        get: { Color(hex: colorHex ?? (category?.effectiveColorHex ?? parent?.effectiveColorHex ?? Category.fallbackColorHex)) },
+                        set: { colorHex = $0.hexString }), supportsOpacity: false).font(.rounded(14))
                     if !topLevel { Button("Same colour as \(parentName)") { colorHex = nil }.font(.rounded(14)) }
                 } header: { Text("Colour") } footer: { Text(topLevel ? "This is the colour of its slice on the Home chart." : "Sub-categories can have their own colour, so vegetables and meat are easy to tell apart inside Food.") }
-                Section {
-                    TextField("No budget", text: $budget).keyboardType(.decimalPad)
-                } header: { Text("Monthly budget (optional)") } footer: { Text("Sets the green line on the spending map. Without one, your usual spending is the line.") }
                 if let category {
                     Section {
                         Button(role: .destructive) { confirmDelete = true } label: { Text("Delete this category") }
@@ -470,25 +583,21 @@ struct CategoryEditSheet: View {
             .onAppear {
                 guard let category else { return }
                 name = category.name; icon = category.icon ?? ""; colorHex = category.colorHex
-                budget = category.budgetSGD.map { $0.formatted(.number.grouping(.never)) } ?? ""
             }
         }
     }
 
     private func save() {
         do {
-            let budgetValue = Double(budget.trimmingCharacters(in: .whitespaces))
             if let category {
                 let trimmed = name.trimmingCharacters(in: .whitespaces)
                 category.name = trimmed
                 category.icon = icon.isEmpty ? nil : icon
-                category.budgetSGD = budgetValue
                 if topLevel { if let colorHex { category.colorHex = colorHex } } else { category.colorHex = colorHex }
                 try? context.save()
                 toaster.show("Saved")
             } else {
                 let made = try Actions.createCategory(name: name, parent: parent, icon: icon.isEmpty ? nil : icon, colorHex: colorHex, in: context)
-                made.budgetSGD = budgetValue
                 try? context.save()
                 toaster.show("Category added")
                 dismiss()

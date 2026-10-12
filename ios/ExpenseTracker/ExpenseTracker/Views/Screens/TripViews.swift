@@ -1,7 +1,6 @@
 import SwiftUI
 import SwiftData
 
-private let tripEmoji = ["🏰", "🗼", "🏔️", "🏖️", "🌆", "🚂", "🎌", "🌲", "🛳️", "🎡"]
 private let tripColors = ["5d8df6", "ff8a75", "4fd1a5", "b36cf0", "ffb066", "f58bd0"]
 
 extension Trip {
@@ -27,7 +26,7 @@ struct TripEditSheet: View {
     @State private var hasEnd = false
     @State private var start = Date()
     @State private var end = Date().addingTimeInterval(86_400 * 5)
-    @State private var emoji = "🧳"
+    @State private var emoji = "trip-castle"
     @State private var colorHex = tripColors[0]
     @State private var activate = true
 
@@ -39,11 +38,18 @@ struct TripEditSheet: View {
                     Toggle("Starts", isOn: $hasStart); if hasStart { DatePicker("", selection: $start, displayedComponents: .date).labelsHidden() }
                     Toggle("Ends", isOn: $hasEnd); if hasEnd { DatePicker("", selection: $end, displayedComponents: .date).labelsHidden() }
                 }
-                Section("Icon") {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack { ForEach(tripEmoji, id: \.self) { e in
-                            Text(e).font(.system(size: 28)).padding(6).background(e == emoji ? Theme.accentSoft : Color.clear, in: RoundedRectangle(cornerRadius: 10)).onTapGesture { emoji = e }
-                        } }
+                Section("Cover") {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                        ForEach(TripArt.all, id: \.key) { art in
+                            Button { emoji = art.key } label: {
+                                VStack(spacing: 3) {
+                                    Color.clear.frame(height: 66).overlay { Image(art.key).resizable().scaledToFill() }
+                                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(emoji == art.key ? Theme.accent : Theme.line, lineWidth: emoji == art.key ? 3 : 1) }
+                                    Text(art.name).font(.rounded(11, emoji == art.key ? .bold : .regular)).foregroundStyle(Theme.text)
+                                }
+                            }.buttonStyle(.plain)
+                        }
                     }
                 }
                 Section("Colour") {
@@ -60,7 +66,7 @@ struct TripEditSheet: View {
             }
             .onAppear {
                 guard let trip else { return }
-                name = trip.name; emoji = trip.emoji ?? "🧳"; colorHex = trip.colorHex ?? tripColors[0]
+                name = trip.name; emoji = TripArt.key(trip.emoji); colorHex = trip.colorHex ?? tripColors[0]
                 if let s = trip.startDate { hasStart = true; start = s }
                 if let e = trip.endDate { hasEnd = true; end = e }
             }
@@ -96,16 +102,19 @@ struct TravelView: View {
             let active = ledger.activeTrip
             let peak = max(1, summary.categories.map(\.spend).max() ?? 1)
             Screen {
-                HStack(spacing: 14) {
-                    IconTile(symbol: "✈️", color: Color(hex: "5d8df6"), size: 52)
-                    VStack(alignment: .leading, spacing: 1) {
+                ZStack(alignment: .topLeading) {
+                    Image("banner-airport").resizable().scaledToFill().frame(height: 170).frame(maxWidth: .infinity).clipped()
+                    VStack(alignment: .leading, spacing: 0) {
                         Text(Money.whole(summary.total)).font(.rounded(30, .heavy))
-                        Text("\(String(format: "%.1f", summary.shareOfSpending))% of your spending").font(.rounded(13)).foregroundStyle(Theme.muted)
+                        Text("\(String(format: "%.1f", summary.shareOfSpending))% of your spending").font(.rounded(12)).foregroundStyle(Theme.muted)
                     }
-                    Spacer()
-                }.padding(16).background(Color(hex: "5d8df6").opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Theme.surface.opacity(0.88), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .padding(12)
+                }
+                .frame(height: 170).clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 NavigationLink(value: Route.tripMode) {
-                    HStack { Text("🧳"); Text(active.map { "Trip Mode is on · \($0.name)" } ?? "Trip Mode is off").font(.rounded(14, .semibold)); Spacer()
+                    HStack { Glyph(symbol: Art.trip, size: 16); Text(active.map { "Trip Mode is on · \($0.name)" } ?? "Trip Mode is off").font(.rounded(14, .semibold)); Spacer()
                         Text(active == nil ? "Turn on" : "Manage").font(.rounded(13, .bold)).foregroundStyle(Theme.accent); Image(systemName: "chevron.right").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.accent) }
                         .padding(12).background(active == nil ? Theme.segBg : Theme.greenBg, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }.buttonStyle(.plain)
@@ -119,7 +128,7 @@ struct TravelView: View {
                         ForEach(summary.trips) { row in
                             NavigationLink(value: Route.trip(row.trip)) {
                                 HStack(spacing: 14) {
-                                    Text(row.trip.emoji ?? "🧳").font(.system(size: 30)).frame(width: 64, height: 64).background(row.trip.banner, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                    TripCover(trip: row.trip, radius: 14).frame(width: 118, height: 68)
                                     VStack(alignment: .leading, spacing: 2) {
                                         HStack(spacing: 6) { Text(row.trip.name).font(.rounded(16, .bold)); if row.trip.isActive { MiniChip(text: "on", style: .good) } }
                                         Text(row.trip.dateRange).font(.rounded(12)).foregroundStyle(Theme.muted)
@@ -145,7 +154,6 @@ struct TravelView: View {
                         }
                     }.card()
                 }
-                Text("Same expenses, two ways of grouping them. Nothing is counted twice.").font(.rounded(12)).foregroundStyle(Theme.muted).frame(maxWidth: .infinity)
             }
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { creating = true } label: { Image(systemName: "plus") } } }
         }
@@ -161,51 +169,53 @@ struct TripDetailView: View {
     enum Tab { case overview, transactions }
     @State private var tab = Tab.overview
     @State private var editing = false
+    @State private var openItemID: String?
 
     var body: some View {
         WithLedger { ledger in
             let detail = ledger.tripDetail(trip)
-            let peak = max(1, detail.tree.roots.map(\.totalSGD).max() ?? 1)
             Screen {
-                HStack(spacing: 14) {
-                    Text(trip.emoji ?? "🧳").font(.system(size: 44))
-                    VStack(alignment: .leading) { Text(trip.name).font(.rounded(22, .bold)); Text(trip.dateRange).font(.rounded(13)) }
-                    Spacer()
-                }.foregroundStyle(.white).shadow(color: .black.opacity(0.25), radius: 6, y: 1).padding(22)
-                    .background(trip.banner, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                TripBanner(trip: trip)
                 SegmentedTabs(options: [(Tab.overview, "Overview"), (Tab.transactions, "Transactions")], selection: $tab)
                 if tab == .overview {
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) { Text(Money.string(detail.summary.spend)).font(.rounded(22, .heavy)); Text("Your spending").font(.rounded(12)).foregroundStyle(Theme.muted) }
-                            .frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.blueBg, bordered: false)
-                        VStack(alignment: .leading, spacing: 2) { Text(Money.string(detail.fronted)).font(.rounded(22, .heavy)); Text("You fronted for others").font(.rounded(12)).foregroundStyle(Theme.muted) }
-                            .frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.orangeBg, bordered: false)
+                    // total spending, big
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Your spending").font(.rounded(13)).foregroundStyle(Theme.muted)
+                        Text(Money.string(detail.summary.spend)).font(.rounded(44, .heavy)).minimumScaleFactor(0.6).lineLimit(1)
+                        Text("\(detail.summary.itemCount) item\(detail.summary.itemCount == 1 ? "" : "s") on this trip").font(.rounded(12)).foregroundStyle(Theme.muted)
                     }
-                    let categories = detail.tree.roots.filter { $0.totalSGD > 0 }
-                    if categories.isEmpty {
+                    .frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.blueBg, bordered: false)
+                    // what you paid for others, and whether it's come back
+                    let stillOwed = ledger.tripStillOwed(trip, fronted: detail.fronted)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Money.string(detail.fronted)).font(.rounded(20, .heavy))
+                        Text("You fronted for others").font(.rounded(12)).foregroundStyle(Theme.muted)
+                        if detail.fronted > 0.005 {
+                            Text(stillOwed <= 0.1 ? "Fully reimbursed!" : "\(Money.string(stillOwed)) still owed").font(.rounded(11, .medium))
+                                .foregroundStyle(stillOwed <= 0.1 ? Theme.good : Theme.warn)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.orangeBg, bordered: false)
+                    let log = ledger.tripLog(trip)
+                    NavigationLink(value: Route.reimbursementLog(trip)) {
+                        HStack(spacing: 12) {
+                            IconTile(symbol: Art.reimbursement, color: Theme.miscColor, size: 36)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Reimbursement log").font(.rounded(15, .semibold)).foregroundStyle(Theme.text)
+                                Text(log.isEmpty ? "What you owe and are owed on this trip" :
+                                        (log.balanced ? "Settled: payments match what you owe" : (log.paid > 0 && log.unaccounted > 0 ? "\(Money.string(log.unaccounted)) paid but not logged" : "Net \(Money.string(abs(log.net))) \(log.net >= 0 ? "to pay" : "owed to you")")))
+                                    .font(.rounded(12)).foregroundStyle(Theme.muted)
+                            }
+                            Spacer(); Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.mutedLine)
+                        }.padding(14)
+                    }.buttonStyle(.plain).background(Theme.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    let root = ledger.tripRootNode(trip, tree: detail.tree)
+                    if root.children.isEmpty {
                         EmptyCard("No spending on this trip yet", trip.isActive ? "Trip Mode is on, so new charges will land here." : "Turn on Trip Mode and new charges land here automatically.")
                     } else {
-                        Rows {
-                            ForEach(categories) { node in
-                                NavigationLink(value: Route.category(CategoryTarget(category: node.category, unsortedOf: nil, scope: .trip(trip)))) {
-                                    HStack(spacing: 12) {
-                                        IconTile(symbol: node.icon, color: Color(hex: node.colorHex), size: 34)
-                                        VStack(spacing: 6) {
-                                            HStack { Text(node.name).font(.rounded(15, .semibold)); Spacer(); Text(Money.whole(node.totalSGD)).font(.rounded(15, .bold)) }
-                                            ProgressView(value: node.totalSGD, total: peak).tint(Color(hex: node.colorHex))
-                                        }
-                                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.mutedLine)
-                                    }.padding(.horizontal, 16).padding(.vertical, 12).rowDivider()
-                                }.buttonStyle(.plain)
-                            }
-                            if detail.tree.unsortedSGD > 0 {
-                                NavigationLink(value: Route.category(CategoryTarget(category: nil, unsortedOf: nil, scope: .trip(trip)))) {
-                                    MenuRow("Unsorted") { Text(Money.whole(detail.tree.unsortedSGD)).font(.rounded(15, .bold)) }
-                                }.buttonStyle(.plain)
-                            }
-                        }.flushCard()
+                        CategoryDonut(node: root, tiles: root.children, scope: .trip(trip), scopeLabel: trip.name, share: 100)
+                        TileBoard(nodes: root.children, items: ledger.items(in: nil, trip: trip).filter { $0.isDeposit || ($0.personalSGD ?? 1) != 0 }, scope: .trip(trip), ledger: ledger) { openItemID = $0.id }
                     }
-                    Text("Who owes what is tracked on the Reimburse tab, not per trip.").font(.rounded(12)).foregroundStyle(Theme.muted).frame(maxWidth: .infinity)
                     NavigationLink(value: Route.tripMode) { Text(trip.isActive ? "Manage Trip Mode" : "Turn on Trip Mode for this trip").font(.rounded(15, .semibold)).frame(maxWidth: .infinity).padding(.vertical, 12) }
                         .buttonStyle(.bordered)
                 } else if detail.entries.isEmpty { EmptyCard("No transactions on this trip yet") }
@@ -215,6 +225,7 @@ struct TripDetailView: View {
         .navigationTitle(trip.name).navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { editing = true } label: { Image(systemName: "pencil") } } }
         .sheet(isPresented: $editing) { TripEditSheet(trip: trip) }
+        .sheet(isPresented: Binding(get: { openItemID != nil }, set: { if !$0 { openItemID = nil } })) { if let id = openItemID { ItemSheet(itemID: id) } }
     }
 }
 
@@ -243,25 +254,21 @@ struct TripModeView: View {
                         })).labelsHidden().tint(Theme.good)
                     }.card()
                     NavigationLink(value: Route.trip(chosen)) {
-                        HStack(spacing: 14) {
-                            Text(chosen.emoji ?? "🧳").font(.system(size: 40))
-                            VStack(alignment: .leading) { Text(chosen.name).font(.rounded(20, .bold)); Text(chosen.dateRange).font(.rounded(13)) }
-                            Spacer()
-                        }.foregroundStyle(.white).padding(22).background(chosen.banner, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        TripBanner(trip: chosen, height: 130)
                     }.buttonStyle(.plain)
                     if sorted.count > 1 {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack { ForEach(sorted) { t in
                                 Button { chosenID = t.persistentModelID } label: {
-                                    Text("\(t.emoji ?? "🧳") \(t.name)").font(.rounded(13, .semibold)).padding(.horizontal, 12).padding(.vertical, 6)
-                                        .foregroundStyle(t.persistentModelID == chosen.persistentModelID ? .white : Theme.muted)
+                                    TripName(trip: t).font(.rounded(13, .semibold)).padding(.horizontal, 12).padding(.vertical, 6)
+                                        .foregroundStyle(t.persistentModelID == chosen.persistentModelID ? Theme.onAccent : Theme.muted)
                                         .background(t.persistentModelID == chosen.persistentModelID ? Theme.accent : Theme.surface, in: Capsule()).overlay { Capsule().stroke(Theme.line) }
                                 }
                             } }
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(isOn ? "✅ Trip Mode is ON" : "Trip Mode is OFF").font(.rounded(16, .bold))
+                        Label(isOn ? "Trip Mode is ON" : "Trip Mode is OFF", systemImage: isOn ? "checkmark.circle.fill" : "circle").font(.rounded(16, .bold))
                         Text(isOn ? "New transactions will be tagged with “\(chosen.name)”. You can untag ones that don’t belong, like rent."
                                   : (ledger.activeTrip.map { "Trip Mode is on for “\($0.name)”. Turning it on here switches it over." } ?? "Turn it on and new transactions tag themselves with this trip."))
                             .font(.rounded(13))
@@ -271,7 +278,7 @@ struct TripModeView: View {
                     NavigationLink(value: Route.categories) { MenuRow("Customise categories") }.buttonStyle(.plain).flushCard()
                 } else {
                     VStack(spacing: 12) {
-                        Text("🧳").font(.system(size: 44))
+                        Mascot(name: "expr-excited", height: 90)
                         Text("Set up before a trip").font(.rounded(18, .bold))
                         Text("Create a trip and turn on Trip Mode. Every new transaction is tagged with it automatically, and you can untag anything unrelated, like rent.")
                             .font(.rounded(14)).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
@@ -298,7 +305,6 @@ struct TripModeView: View {
                     }.buttonStyle(.plain)
                 }
             }
-            Text("Tap one to see what this trip spent there. Your own categories work as usual.").font(.rounded(12)).foregroundStyle(Theme.muted)
         }.frame(maxWidth: .infinity, alignment: .leading).card()
     }
 }
@@ -306,7 +312,7 @@ struct TripModeView: View {
 // MARK: - Reimbursements
 
 struct ReimburseView: View {
-    enum Tab { case owed, history }
+    enum Tab { case owed, history, paidOut }
     @Environment(\.modelContext) private var context
     @State private var tab = Tab.owed
     @State private var showAll = false
@@ -315,13 +321,46 @@ struct ReimburseView: View {
         WithLedger { ledger in
             let data = ledger.reimbursementSummary()
             Screen {
-                SegmentedTabs(options: [(Tab.owed, "Owed back to you"), (Tab.history, "History")], selection: $tab)
-                if tab == .owed { owed(data) } else { history(data) }
+                SegmentedTabs(options: [(Tab.owed, "Owed to you"), (Tab.paidOut, "Paid out"), (Tab.history, "History")], selection: $tab)
+                if tab == .owed { owed(data) } else if tab == .paidOut { paidOut(ledger) } else { history(data) }
             }
             .onAppear { Actions.recordCheckpointIfNeeded(data, in: context) }
             .onChange(of: data.pendingCheckpoint != nil) { _, pending in if pending { Actions.recordCheckpointIfNeeded(data, in: context) } }
         }
         .navigationTitle("Reimbursement").navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// What you've sent to people, and whether you've said what each covered.
+    @ViewBuilder
+    private func paidOut(_ ledger: Ledger) -> some View {
+        let sent = ledger.transactions.filter { $0.payee != nil && $0.transactionType == .expense }
+            .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+        let total = sent.reduce(0) { $0 + abs($1.amountSGD ?? 0) }
+        VStack(spacing: 6) {
+            Text(Money.whole(total)).font(.rounded(42, .heavy))
+            Text("paid to people").foregroundStyle(Theme.muted)
+            Text("\(sent.filter { $0.matchedReceipt == nil }.count) not itemised yet").font(.rounded(12)).foregroundStyle(Theme.muted)
+        }.frame(maxWidth: .infinity).padding(.vertical, 8)
+        if sent.isEmpty {
+            EmptyCard("Nothing paid to anyone yet", "Payments to friends from YouTrip or PayNow show here. On any payment, tap “Paid to a person?” to add it.")
+        } else {
+            Rows {
+                ForEach(sent) { t in
+                    NavigationLink(value: Route.transaction(t)) {
+                        HStack(spacing: 12) {
+                            IconTile(symbol: Art.person, color: Theme.miscColor, size: 36)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(t.payee ?? "").font(.rounded(15, .semibold)).lineLimit(1)
+                                Text([t.date?.formatted(.dateTime.day().month(.abbreviated)), t.matchedReceipt != nil ? "itemised" : "not itemised"].compactMap { $0 }.joined(separator: " · "))
+                                    .font(.rounded(12)).foregroundStyle(Theme.muted)
+                            }
+                            Spacer()
+                            Text(Money.string(abs(t.amountSGD ?? 0))).font(.rounded(15, .bold))
+                        }.padding(.horizontal, 14).padding(.vertical, 12).rowDivider()
+                    }.buttonStyle(.plain)
+                }
+            }.flushCard()
+        }
     }
 
     private enum Line: Identifiable { case paid(PaidEntry), received(ReceivedEntry)
@@ -332,31 +371,40 @@ struct ReimburseView: View {
     private func owed(_ data: ReimbursementData) -> some View {
         let lines = (data.recentPaid.map(Line.paid) + data.recentReceived.map(Line.received)).sorted { $0.date > $1.date }
         let shown = showAll ? lines : Array(lines.prefix(5))
-        VStack(spacing: 8) {
+        // the mascot rummaging for what's owed (or relaxing once it's all settled)
+        // one card: the mascot fills its left edge, the amount sits on the right
+        HStack(spacing: 0) {
+        Image(data.settled || data.outstanding <= 0.005 ? "mascot-scene-on-track" : "mascot-scene-reimbursements").resizable().scaledToFit()
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(width: 124).padding(.leading, 10)
+            .accessibilityHidden(true)
+        VStack(spacing: 6) {
             if data.overReimbursed {
-                Text(Money.whole(-data.outstanding)).font(.rounded(42, .heavy))
-                Text("received beyond what you were owed").foregroundStyle(Theme.muted)
-                Text("Open the reimbursement that pushed it over and tell the app how to treat the extra, or that earlier records were incomplete.").font(.rounded(13)).multilineTextAlignment(.center)
+                Text(Money.whole(-data.outstanding)).font(.rounded(34, .heavy))
+                Text("received beyond what you were owed").font(.rounded(13)).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
+                Text("Open the reimbursement that pushed it over and tell the app how to treat the extra, or that earlier records were incomplete.").font(.rounded(12)).multilineTextAlignment(.center)
             } else if data.settled || data.outstanding <= 0.005 {
-                Text("🎉").font(.system(size: 40))
-                Text("All settled").font(.rounded(30, .heavy))
-                Text(data.receivedTotal > 0 ? "\(Money.whole(data.receivedTotal)) paid back so far" : "Nobody owes you anything").foregroundStyle(Theme.muted)
+                Text("All settled").font(.rounded(26, .heavy))
+                Text(data.receivedTotal > 0 ? "\(Money.whole(data.receivedTotal)) paid back so far" : "Nobody owes you anything").font(.rounded(13)).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
             } else {
-                Text(Money.whole(data.outstanding)).font(.rounded(42, .heavy))
-                Text("owed back to you").foregroundStyle(Theme.muted)
+                Text(Money.whole(data.outstanding)).font(.rounded(38, .heavy)).minimumScaleFactor(0.6).lineLimit(1)
+                Text("owed back to you").font(.rounded(14)).foregroundStyle(Theme.muted)
                 if !data.recentPaid.isEmpty {
-                    Text(data.lastCheckpoint.map { "Since everything was last settled on \($0.formatted(.dateTime.day().month(.abbreviated).year()))" } ?? "Across everything you’ve fronted so far").font(.rounded(12)).foregroundStyle(Theme.muted)
+                    Text(data.lastCheckpoint.map { "Since everything was last settled on \($0.formatted(.dateTime.day().month(.abbreviated).year()))" } ?? "Across everything you’ve fronted so far").font(.rounded(11)).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
                 }
             }
         }
-        .frame(maxWidth: .infinity).padding(22).background(data.settled ? Theme.greenBg : (data.overReimbursed ? Theme.orangeBg : Theme.warmBg), in: RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+        .frame(maxWidth: .infinity).padding(.horizontal, 12).padding(.vertical, 18)
+        }
+        .background(data.settled ? Theme.greenBg : (data.overReimbursed ? Theme.orangeBg : Theme.warmBg))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
         SectionTitle("Recent activity") {
             if lines.count > 5 { Button(showAll ? "Show fewer" : "See all") { showAll.toggle() }.font(.rounded(13, .semibold)) }
         }
         if shown.isEmpty { Text("Nothing paid for others yet. Open a transaction and use “Split / Paid for others”.").font(.rounded(13)).foregroundStyle(Theme.muted) }
         else { Rows { ForEach(shown) { line in activityRow(line) } }.flushCard() }
         HStack(alignment: .top, spacing: 10) {
-            Text("💡"); VStack(alignment: .leading, spacing: 2) { Text("Tip").font(.rounded(14, .bold))
+            Glyph(symbol: Art.tip, size: 18); VStack(alignment: .leading, spacing: 2) { Text("Tip").font(.rounded(14, .bold))
                 Text("When money arrives from a friend, open it and mark it as a reimbursement. That lowers what you’re owed without touching your spending.").font(.rounded(13)) }
         }.card(background: Theme.orangeBg, bordered: false)
     }

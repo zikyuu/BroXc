@@ -5,7 +5,7 @@ import PhotosUI
 // MARK: - Activity feed
 
 struct ActivityView: View {
-    enum Filter: Hashable { case all, review, noReceipt, moneyIn }
+    enum Filter: Hashable { case all, review, noReceipt, noCharge, moneyIn }
     @State private var filter = Filter.all
 
     var body: some View {
@@ -13,11 +13,20 @@ struct ActivityView: View {
             let entries = ledger.activityFeed()
             let shown = entries.filter(test)
             Screen {
+                HStack(alignment: .bottom) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Activity").font(.rounded(34, .heavy))
+                        Text("\(entries.count) transaction\(entries.count == 1 ? "" : "s")").font(.rounded(13)).foregroundStyle(Theme.muted)
+                    }
+                    Spacer()
+                    Mascot(name: "shopping", height: 86)
+                }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack {
                         chip(.all, "All", entries.count, show: false)
                         chip(.review, "Check match", entries.filter { $0.status == "needs_review" }.count)
                         chip(.noReceipt, "No receipt", entries.filter { $0.status == "unmatched" }.count)
+                        chip(.noCharge, "Receipt, no charge", entries.filter { $0.status == "receipt_only" }.count)
                         chip(.moneyIn, "Money in", entries.filter { $0.isIncoming && !$0.outflow }.count)
                     }
                 }
@@ -31,12 +40,12 @@ struct ActivityView: View {
             }
             .overlay(alignment: .bottomTrailing) {
                 NavigationLink(value: Route.add) {
-                    Image(systemName: "plus").font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)
+                    Image(systemName: "plus").font(.system(size: 22, weight: .semibold)).foregroundStyle(Theme.onAccent)
                         .frame(width: 56, height: 56).background(Theme.accent, in: Circle()).shadow(color: Theme.accent.opacity(0.4), radius: 10, y: 5)
                 }.padding(20)
             }
         }
-        .navigationTitle("Activity")
+        .navigationTitle("")
         .toolbar { ToolbarItem(placement: .topBarTrailing) { NavigationLink(value: Route.search) { Image(systemName: "magnifyingglass") } } }
     }
 
@@ -45,6 +54,7 @@ struct ActivityView: View {
         case .all: true
         case .review: e.status == "needs_review"
         case .noReceipt: e.status == "unmatched"
+        case .noCharge: e.status == "receipt_only"
         case .moneyIn: e.isIncoming && !e.outflow
         }
     }
@@ -53,7 +63,7 @@ struct ActivityView: View {
         Button { filter = value } label: {
             Text(label + (show && count > 0 ? " \(count)" : "")).font(.rounded(13, .semibold)).lineLimit(1)
                 .padding(.horizontal, 12).padding(.vertical, 6)
-                .foregroundStyle(filter == value ? .white : Theme.muted)
+                .foregroundStyle(filter == value ? Theme.onAccent : Theme.muted)
                 .background(filter == value ? Theme.accent : Theme.surface, in: Capsule())
                 .overlay { Capsule().stroke(Theme.line) }
         }.buttonStyle(.plain)
@@ -76,6 +86,9 @@ struct TransactionView: View {
     @State private var openItemID: String?
     @State private var selecting = false
     @State private var selected = Set<String>()
+    @State private var pickingVisit = false
+    @State private var namingPayee = false
+    @State private var payeeName = ""
     @FocusState private var noteFocused: Bool
 
     var body: some View {
@@ -91,13 +104,13 @@ struct TransactionView: View {
             Screen {
                 hero(t, incoming: incoming, single: single, count: real.count, ledger: ledger)
                 if t.status == "needs_review" { reviewCard(t) }
+                if !incoming, let payee = t.payee { paymentCard(t, payee) }
                 if t.transactionType == .transferOwnAccount { transferCard(t, ledger) }
                 if let receipt = t.matchedReceipt { ItemsDontAddUpCard(receipt: receipt) }
                 if !incoming, let guess = single, guess.isVirtual, guess.confidence == .suggested, let category = guess.category {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Guessed category: \(category.path.suffix(2).joined(separator: " › "))").font(.rounded(15, .bold))
                         if let note = guess.suggestionNote { Text(note).font(.rounded(13)).foregroundStyle(Theme.muted) }
-                        Text("Until you confirm it, this is counted as a guess, not as sorted.").font(.rounded(12)).foregroundStyle(Theme.muted)
                         HStack {
                             Button("Looks right") { Actions.acceptSuggestions([guess], ledger: ledger, in: context); toaster.show("Confirmed") }.buttonStyle(.borderedProminent)
                             Button("Change") { pickingCategory = true }.buttonStyle(.bordered)
@@ -124,6 +137,9 @@ struct TransactionView: View {
                                     Text(t.matchStatus == "approved" ? "confirmed" : "matched").font(.rounded(12)).foregroundStyle(Theme.muted)
                                 }
                             }.buttonStyle(.plain)
+                            Button { pickingVisit = true } label: {
+                                MenuRow("Kind of visit", hint: "e.g. Grocery Shopping. Your lines keep their own categories") { CategoryChip(category: receipt.visitCategory, confidence: .confirmed) }
+                            }.buttonStyle(.plain)
                         } else {
                             Button { linking = true } label: { MenuRow("Add receipt", hint: "Link one you’ve uploaded, or upload it now") }.buttonStyle(.plain)
                         }
@@ -132,11 +148,20 @@ struct TransactionView: View {
                                 MenuRow("Break down into items", hint: "e.g. your share of a Tricount: what you actually spent, by category")
                             }.buttonStyle(.plain)
                         }
+                        if t.payee == nil {
+                            Button { payeeName = (t.transactionDescription ?? "").replacingOccurrences(of: "PayNow to ", with: ""); namingPayee = true } label: {
+                                MenuRow("Paid to a person?", hint: "Money you sent to a friend: a shared bill, rent, paying someone back")
+                            }.buttonStyle(.plain)
+                        } else {
+                            Button { Actions.setPayee(t, nil, in: context); toaster.show("No longer marked as paid to a person") } label: {
+                                MenuRow("Not paid to a person", hint: "Treat it as an ordinary purchase", chevron: false)
+                            }.buttonStyle(.plain)
+                        }
                         NavigationLink(value: Route.classify(t)) { MenuRow("Not a purchase?", hint: "Mark it as money in: a reimbursement, top up, or your own category") }.buttonStyle(.plain)
                     }.flushCard()
                 }
                 if real.count > 1 || (real.count == 1 && itemised) {
-                    SectionTitle("Items") { SelectButton(selecting: $selecting, selected: $selected) }
+                    SectionTitle("Items") { HStack(spacing: 14) { if let r = t.matchedReceipt, r.isItemised { AddLineButton(receipt: r) }; SelectButton(selecting: $selecting, selected: $selected) } }
                     ItemList(items: items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -150,12 +175,24 @@ struct TransactionView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
                 Menu { Button("Delete transaction", systemImage: "trash", role: .destructive) { confirmDelete = true } } label: { Image(systemName: "ellipsis.circle") }
             } }
+            .alert("Who was it paid to?", isPresented: $namingPayee) {
+                TextField("Name", text: $payeeName)
+                Button("Save") { Actions.setPayee(t, payeeName, in: context); toaster.show("Marked as paid to \(payeeName)") }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("It still counts as spending. This just lets you say what it covered.") }
             .sheet(isPresented: $pickingTrip) { TripPicker(current: t.trip) { Actions.assign(t, to: $0, in: context); toaster.show("Trip updated") } }
             .sheet(isPresented: $pickingCategory) {
                 if let single {
                     CategoryPicker(title: "Category", selected: single.category, allowClear: true, teach: true) { category, remember, similar in
                         Actions.assignCategory([single], to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
-                        toaster.show(category.map { "Moved to \($0.name)" } ?? "Cleared")
+                        toaster.show(category.map { "Recategorised to \($0.name)" } ?? "Cleared")
+                    }
+                }
+            }
+            .sheet(isPresented: $pickingVisit) {
+                if let receipt = t.matchedReceipt {
+                    CategoryPicker(title: "What kind of visit?", selected: receipt.visitCategory, allowClear: true) { category, _, _ in
+                        Actions.setVisitCategory(receipt, category, in: context); toaster.show(category.map { "Shown as \($0.name)" } ?? "Back to automatic")
                     }
                 }
             }
@@ -170,6 +207,19 @@ struct TransactionView: View {
         .onDisappear { if (transaction.userNote ?? "") != note.trimmingCharacters(in: .whitespacesAndNewlines) { Actions.setNote(transaction, note, in: context) } }
     }
 
+    /// Money sent to a person: spending whose real content is whatever the payment covered.
+    private func paymentCard(_ t: YouTripTransaction, _ payee: String) -> some View {
+        let itemised = t.matchedReceipt != nil
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Paid to \(payee)").font(.rounded(15, .bold))
+            Text(itemised ? "Itemised: the lines below are what it covered, and they count in their own categories and trip."
+                          : "Until you say what it covered (your share of a Tricount, a bill you split, rent), all of it sits in Unsorted. Break it down into items, each in a category, and pick a trip.")
+                .font(.rounded(13)).foregroundStyle(Theme.muted)
+            NavigationLink(value: Route.breakdown(t)) { Text(itemised ? "Edit the breakdown" : "Break down into items").font(.rounded(14, .semibold)) }
+                .buttonStyle(.borderedProminent)
+        }.frame(maxWidth: .infinity, alignment: .leading).card(background: itemised ? Theme.greenBg : Theme.blueBg, bordered: false)
+    }
+
     /// Whether the other half of a move between your own accounts has turned up.
     @ViewBuilder
     private func transferCard(_ t: YouTripTransaction, _ ledger: Ledger) -> some View {
@@ -177,7 +227,7 @@ struct TransactionView: View {
         let partner = pairing.partner[t.uid].flatMap { id in ledger.transactions.first { $0.uid == id } }
         VStack(alignment: .leading, spacing: 6) {
             if let partner {
-                Text("Moved between your own accounts ✓").font(.rounded(15, .bold))
+                Label("Moved between your own accounts", systemImage: "checkmark.circle.fill").font(.rounded(15, .bold))
                 Text("\(t.isOutflow ? "Out of \(ledger.info(t.account).name), into \(ledger.info(partner.account).name)" : "Out of \(ledger.info(partner.account).name), into \(ledger.info(t.account).name)") on \(partner.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"). It isn’t spending or income.")
                     .font(.rounded(13)).foregroundStyle(Theme.muted)
             } else if pairing.waiting.contains(where: { $0.uid == t.uid }) {
@@ -200,8 +250,11 @@ struct TransactionView: View {
     private func hero(_ t: YouTripTransaction, incoming: Bool, single: ItemView?, count: Int, ledger: Ledger) -> some View {
         let local = t.localAmount.map { "\(t.localCurrency ?? "") \(String(format: "%.2f", $0))".trimmingCharacters(in: .whitespaces) }
         return VStack(spacing: 5) {
-            if incoming { IconTile(symbol: "⬇️", color: Theme.good, size: 56) }
-            else { IconTile(symbol: single?.category?.icon ?? "🧾", color: single?.category.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor, size: 56) }
+            if incoming { IconTile(symbol: Art.type(t.transactionType), color: Theme.good, size: 56) }
+            else {
+                let visit = t.matchedReceipt?.visitCategory ?? single?.category
+                IconTile(symbol: visit?.icon ?? Art.receipt, color: visit.map { Color(hex: $0.effectiveColorHex) } ?? Theme.miscColor, size: 56)
+            }
             Text(t.transactionDescription ?? "Unknown charge").font(.rounded(20, .bold)).multilineTextAlignment(.center)
             Text([t.date?.formatted(.dateTime.day().month(.abbreviated).year()), t.trip?.name].compactMap { $0 }.joined(separator: " · ")).font(.rounded(13)).foregroundStyle(Theme.muted)
             Text(incoming && !t.isOutflow ? Money.string(t.amountSGD, sign: true) : Money.string(-(t.amountSGD ?? 0))).font(.rounded(36, .heavy)).foregroundStyle(incoming && !t.isOutflow ? Theme.good : (incoming ? Theme.muted : Theme.text))
@@ -209,8 +262,8 @@ struct TransactionView: View {
             HStack(spacing: 8) {
                 if !incoming {
                     Button { pickingTrip = true } label: {
-                        Text(t.trip.map { "🧳 \($0.name)" } ?? "+ Trip").font(.rounded(13, .semibold)).padding(.horizontal, 12).padding(.vertical, 6)
-                            .foregroundStyle(t.trip == nil ? Theme.muted : .white).background(t.trip == nil ? Color.clear : Theme.accent, in: Capsule())
+                        Group { if let trip = t.trip { TripName(trip: trip) } else { Text("+ Trip") } }.font(.rounded(13, .semibold)).padding(.horizontal, 12).padding(.vertical, 6)
+                            .foregroundStyle(t.trip == nil ? Theme.muted : Theme.onAccent).background(t.trip == nil ? Color.clear : Theme.accent, in: Capsule())
                             .overlay { if t.trip == nil { Capsule().strokeBorder(Theme.mutedLine, style: StrokeStyle(lineWidth: 1, dash: [4, 3])) } }
                     }
                 }
@@ -263,6 +316,48 @@ struct TransactionView: View {
 
 // MARK: - Receipt check
 
+/// A small form to add a line to a receipt by hand.
+struct AddLineSheet: View {
+    let receipt: Receipt
+    @State var name = ""
+    @State var amount = ""
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var context
+    @Environment(Toaster.self) private var toaster
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("What was it?") { TextField("Name", text: $name) }
+                Section("Price (\(receipt.currency ?? "SGD"))") { TextField("0.00", text: $amount).keyboardType(.decimalPad) }
+            }
+            .navigationTitle("Add a line").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Add") {
+                        do {
+                            try Actions.addLine(to: receipt, name: name, price: Double(amount.replacingOccurrences(of: ",", with: ".")) ?? 0, in: context)
+                            toaster.show("Added"); dismiss()
+                        } catch { toaster.show(error.localizedDescription, error: true) }
+                    }
+                }
+            }
+        }.presentationDetents([.medium])
+    }
+}
+
+/// "+" for the Items header: add a line by hand when the receipt read one wrong or missed it.
+struct AddLineButton: View {
+    let receipt: Receipt
+    @State private var adding = false
+    var body: some View {
+        Button { adding = true } label: { Image(systemName: "plus.circle").font(.system(size: 17)) }
+            .buttonStyle(.plain).foregroundStyle(Theme.accent).accessibilityLabel("Add a line")
+            .sheet(isPresented: $adding) { AddLineSheet(receipt: receipt) }
+    }
+}
+
 /// Shown when a receipt's lines don't add up to its printed total: the reader skipped or misread something.
 struct ItemsDontAddUpCard: View {
     let receipt: Receipt
@@ -296,6 +391,8 @@ struct ItemsDontAddUpCard: View {
                         .buttonStyle(.borderedProminent).disabled(rereading)
                     if gap > 0 { Button("Add the missing line") { name = "Missed item"; amount = String(format: "%.2f", gap); adding = true }.buttonStyle(.bordered) }
                 }
+                Button("Ignore this \(String(format: "%.2f", abs(gap))) \(currency) difference") { Actions.waiveGap(receipt, in: context); toaster.show("Ignored") }
+                    .font(.rounded(13, .semibold))
                 if receipt.sourceImagePath?.isEmpty == false {
                     Button("Or re-read the saved photo") { Task { await reread(from: nil) } }.font(.rounded(13, .semibold)).disabled(rereading)
                 }
@@ -321,26 +418,7 @@ struct ItemsDontAddUpCard: View {
                     if let data = image.pngData(), let cg = ImageLoader.cgImage(from: data) { Task { await reread(from: cg) } }
                 }, onCancel: { scanning = false }).ignoresSafeArea()
             }
-            .sheet(isPresented: $adding) {
-                NavigationStack {
-                    Form {
-                        Section("What was it?") { TextField("Name", text: $name) }
-                        Section("Price (\(currency))") { TextField("0.00", text: $amount).keyboardType(.decimalPad) }
-                    }
-                    .navigationTitle("Add missing line").navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) { Button("Cancel") { adding = false } }
-                        ToolbarItem(placement: .topBarTrailing) {
-                            Button("Add") {
-                                do {
-                                    try Actions.addLine(to: receipt, name: name, price: Double(amount.replacingOccurrences(of: ",", with: ".")) ?? 0, in: context)
-                                    toaster.show("Added"); adding = false
-                                } catch { toaster.show(error.localizedDescription, error: true) }
-                            }
-                        }
-                    }
-                }.presentationDetents([.medium])
-            }
+            .sheet(isPresented: $adding) { AddLineSheet(receipt: receipt, name: name, amount: amount) }
         }
     }
 }
@@ -370,7 +448,7 @@ extension ItemsDontAddUpCard {
         }
         let result = Actions.applyReread(entries, to: receipt, in: context)
         if result.added + result.fixed == 0 { toaster.show("Nothing new found. Add the missing line by hand.") }
-        else if receipt.unexplainedAmount == nil { toaster.show("Found \(result.added) missing line\(result.added == 1 ? "" : "s") and fixed \(result.fixed) price\(result.fixed == 1 ? "" : "s"): it adds up now ✓") }
+        else if receipt.unexplainedAmount == nil { toaster.show("Found \(result.added) missing line\(result.added == 1 ? "" : "s") and fixed \(result.fixed) price\(result.fixed == 1 ? "" : "s"): it adds up now") }
         else { toaster.show("Found \(result.added) line\(result.added == 1 ? "" : "s"), fixed \(result.fixed) price\(result.fixed == 1 ? "" : "s"). Still short, see the card.") }
     }
 }
@@ -385,6 +463,9 @@ struct ReceiptView: View {
     @State private var selecting = false
     @State private var selected = Set<String>()
     @State private var openItemID: String?
+    @State private var viewingPhoto = false
+    @State private var linking = false
+    @State private var pickingVisit = false
 
     var body: some View {
         WithLedger { ledger in
@@ -396,18 +477,44 @@ struct ReceiptView: View {
                     Text(receipt.date?.formatted(.dateTime.day().month(.abbreviated).year()) ?? "No date").font(.rounded(13)).foregroundStyle(Theme.muted)
                     Text(Money.string(total)).font(.rounded(32, .heavy))
                     if let c = receipt.currency, c != "SGD" { Text("printed in \(c)").font(.rounded(12)).foregroundStyle(Theme.muted) }
-                    Button { pickingTrip = true } label: { Text(receipt.trip.map { "🧳 \($0.name)" } ?? "+ Trip").font(.rounded(13, .semibold)) }
+                    Button { pickingVisit = true } label: {
+                        HStack(spacing: 6) { Text("Kind of visit").foregroundStyle(Theme.muted); CategoryChip(category: receipt.visitCategory, confidence: .confirmed, full: true) }.font(.rounded(13))
+                    }.buttonStyle(.plain)
+                    Button { pickingTrip = true } label: { Group { if let trip = receipt.trip { TripName(trip: trip) } else { Text("+ Trip") } }.font(.rounded(13, .semibold)) }
                 }.frame(maxWidth: .infinity, alignment: .leading).card()
                 ItemsDontAddUpCard(receipt: receipt)
-                if let image = storedImage { image.resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous)) }
+                if let image = storedImage {
+                    Button { viewingPhoto = true } label: {
+                        HStack(spacing: 12) {
+                            image.resizable().scaledToFill().frame(width: 52, height: 52).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("View receipt").font(.rounded(15, .semibold)).foregroundStyle(Theme.text)
+                                Text("The photo this was read from").font(.rounded(12)).foregroundStyle(Theme.muted)
+                            }
+                            Spacer(); Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundStyle(Theme.muted)
+                        }.padding(10).background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }.buttonStyle(.plain)
+                }
                 if let linked { NavigationLink(value: Route.transaction(linked)) { MenuRow("Open the linked transaction") }.buttonStyle(.plain).flushCard() }
-                else { candidates(ledger) }
-                SectionTitle("Items") { SelectButton(selecting: $selecting, selected: $selected) }
+                else {
+                    // unlinked receipts and charges are listed in Activity ("Check match" / "No receipt"); this is just a way to link one
+                    Button { linking = true } label: { MenuRow("Not linked to a charge yet", hint: "It still counts in your spending. Tap to link one") { Text("Link").font(.rounded(13, .semibold)).foregroundStyle(Theme.accent) } }
+                        .buttonStyle(.plain).flushCard()
+                }
+                SectionTitle("Items") { HStack(spacing: 14) { AddLineButton(receipt: receipt); SelectButton(selecting: $selecting, selected: $selected) } }
                 ItemList(items: items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
             }
             .itemSelection(selecting: $selecting, selected: $selected, ledger: ledger, all: items)
             .navigationTitle(receipt.merchant ?? "Receipt").navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $pickingTrip) { TripPicker(current: receipt.trip) { Actions.assign(receipt, to: $0, in: context); toaster.show("Trip updated") } }
+            .sheet(isPresented: $pickingVisit) {
+                CategoryPicker(title: "What kind of visit?", selected: receipt.visitCategory, allowClear: true) { category, _, _ in
+                    Actions.setVisitCategory(receipt, category, in: context); toaster.show(category.map { "Shown as \($0.name)" } ?? "Back to automatic")
+                }
+            }
+            .sheet(isPresented: $viewingPhoto) { if let path = receipt.sourceImagePath, let image = ImageLoader.load(path) { PhotoViewer(image: image) } }
+            .sheet(isPresented: $linking) { NavigationStack { ScrollView { candidates(ledger).padding(16) }.screenBackground().navigationTitle("Link a charge").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { linking = false } } } }.presentationDetents([.medium, .large]) }
             .sheet(isPresented: Binding(get: { openItemID != nil }, set: { if !$0 { openItemID = nil } })) { if let id = openItemID { ItemSheet(itemID: id) } }
         }
     }
@@ -423,7 +530,6 @@ struct ReceiptView: View {
         let open = ledger.unmatchedCharges
         VStack(alignment: .leading, spacing: 8) {
             Text("No charge linked yet").font(.rounded(15, .bold))
-            Text("It still counts in your spending. Link the matching YouTrip charge once you’ve uploaded it.").font(.rounded(13)).foregroundStyle(Theme.muted)
             if open.isEmpty { Text("No unlinked charges to pair it with.").font(.rounded(13)).foregroundStyle(Theme.muted) }
             else {
                 Rows {
@@ -490,7 +596,6 @@ struct SplitView: View {
                     Text("This will be recorded as:").font(.rounded(14, .bold))
                     Text("• \(Money.string(mine)) in \(where_)").font(.rounded(13))
                     Text("• \(Money.string(others)) in Paid for others (not in spending)").font(.rounded(13))
-                    Text("The transaction stays \(Money.string(total)) in your cash history.").font(.rounded(12)).foregroundStyle(Theme.muted)
                 }.frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.blueBg, bordered: false)
                 if !valid { Text("Your share has to be between $0 and \(Money.string(total)).").font(.rounded(13)).foregroundStyle(Theme.bad) }
                 PrimaryButton(title: "Confirm", disabled: !valid) {
@@ -553,12 +658,13 @@ struct ClassifyView: View {
     private var options: [Option] {
         // money leaving an account can only be a move into another of your own accounts (or a purchase, via the button below)
         if transaction.isOutflow {
-            return [Option(type: .transferOwnAccount, label: nil, icon: "🔁", title: "Move to my own account", hint: "Between your accounts: not spending")]
+            return [Option(type: .transferOwnAccount, label: nil, icon: Art.transfer, title: "Move to my own account", hint: "Between your accounts: not spending")]
         }
-        var list = [Option(type: .reimbursement, label: nil, icon: "🤝", title: "Reimbursement", hint: "Reduces your “owed back” balance"),
-                    Option(type: .transferOwnAccount, label: nil, icon: "🔁", title: "Top up", hint: "Money from your own account: not income")]
-        list += labels.map { Option(type: .income, label: $0.name, icon: "💰", title: $0.name, hint: "Your own category") }
-        if transaction.transactionType == .refund { list.append(Option(type: .refund, label: nil, icon: "↩️", title: "Refund", hint: "For a previous purchase")) }
+        var list = [Option(type: .reimbursement, label: nil, icon: Art.reimbursement, title: "Reimbursement", hint: "Reduces your “owed back” balance"),
+                    Option(type: .transferOwnAccount, label: nil, icon: Art.transfer, title: "Top up", hint: "Money from your own account: not income"),
+                    Option(type: .cashback, label: nil, icon: Art.cashback, title: "Cashback", hint: "Money back on a purchase: lowers your spending")]
+        list += labels.map { Option(type: .income, label: $0.name, icon: Art.income, title: $0.name, hint: "Your own category") }
+        if transaction.transactionType == .refund { list.append(Option(type: .refund, label: nil, icon: Art.refund, title: "Refund", hint: "For a previous purchase")) }
         return list
     }
 
@@ -572,7 +678,7 @@ struct ClassifyView: View {
 
             Screen {
                 VStack(spacing: 4) {
-                    IconTile(symbol: "⬇️", color: Theme.good, size: 52)
+                    IconTile(symbol: Art.moneyIn, color: Theme.good, size: 52)
                     Text(Money.string(amount, sign: true)).font(.rounded(34, .heavy)).foregroundStyle(Theme.good)
                     Text(transaction.transactionDescription ?? "Unknown").font(.rounded(16, .bold))
                     Text(transaction.date?.formatted(.dateTime.day().month(.abbreviated).year()) ?? "").font(.rounded(13)).foregroundStyle(Theme.muted)
@@ -623,7 +729,6 @@ struct ClassifyView: View {
                                 Text("\(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "") · \(t.transactionDescription ?? "") · \(Money.string(t.amountSGD))").tag(Optional(t.matchedReceipt!))
                             }
                         }
-                        Text("Linking it keeps the record straight. Category totals aren’t netted automatically yet.").font(.rounded(12)).foregroundStyle(Theme.muted)
                     }.card()
                 }
                 if type != nil { PrimaryButton(title: "Save") { save(amount: amount, owed: owed, excess: excess) } }
@@ -701,7 +806,7 @@ struct BreakdownView: View {
                             .font(.rounded(13)).foregroundStyle(Theme.muted)
                     }.frame(maxWidth: .infinity, alignment: .leading).card(background: Theme.blueBg, bordered: false)
                     Button { pickingTrip = true } label: {
-                        Rows { MenuRow("Trip", hint: "The items below count toward it") { Text(transaction.trip.map { "🧳 \($0.name)" } ?? "None").font(.rounded(14)).foregroundStyle(Theme.muted) } }.flushCard()
+                        Rows { MenuRow("Trip", hint: "The items below count toward it") { Text(transaction.trip?.name ?? "None").font(.rounded(14)).foregroundStyle(Theme.muted) } }.flushCard()
                     }.buttonStyle(.plain)
                     VStack(spacing: 10) {
                         ForEach($rows) { $row in

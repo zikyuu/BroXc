@@ -63,6 +63,10 @@ final class Category {
 
     var depth: Int { path.count - 1 }
 
+    /// The category whose unitemised spending belongs in Grocery Shopping (Food, Cooking Ingredients): a supermarket charge with no receipt
+    /// can't be split into meat, vegetables and so on, so it goes to the store-type category instead.
+    var isGroceryParent: Bool { name == "Cooking Ingredients" && parent?.name == "Food" }
+
     var root: Category {
         var node = self
         var seen = Set<PersistentIdentifier>()
@@ -87,15 +91,17 @@ final class Category {
 
     /// Colours offered when editing a category, and drawn from for new sub-categories.
     static let palette = [
-        "#e5635a", "#ff8a75", "#f08a24", "#f2c94c", "#a5d86e", "#5fbf6a", "#4fd1a5", "#4fb6d9",
-        "#5d8df6", "#7c83f5", "#b36cf0", "#f58bd0", "#c9a877", "#9b6b4f",
+        "#e8786a", "#f2a08f", "#ee9a45", "#f5c26b", "#b7d28c", "#8fbf7a", "#7cc6b0", "#8fb4d6",
+        "#7f9fd8", "#a99bd8", "#c79ad0", "#f2a9c4", "#c9a27e", "#a07a5e",
     ]
+    /// The palette before the BroXc theme, so a category that still has an untouched old default can be moved to the new one.
+    static let legacyTopLevelColors = ["#ff8a75", "#5d8df6", "#7c83f5", "#ffb066", "#b36cf0", "#f58bd0", "#a5d86e", "#4fd1a5", "#c9a877"]
 
     static let fallbackColorHex = "#a9a39a"
 
     /// Top-level starter colours, assigned by position — the same palette the web build used.
     static let topLevelColors = [
-        "#ff8a75", "#5d8df6", "#7c83f5", "#ffb066", "#b36cf0",
-        "#f58bd0", "#a5d86e", "#4fd1a5", "#c9a877",
+        "#f2a08f", "#8fb4d6", "#a99bd8", "#f5c26b", "#c79ad0",
+        "#f2a9c4", "#9cc77f", "#7cc6b0", "#c9a27e",
     ]
 }

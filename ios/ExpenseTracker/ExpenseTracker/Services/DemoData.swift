@@ -6,8 +6,45 @@ import SwiftData
 /// home so "usual" and trends have history, a trip with Trip Mode on, and a balance check that finds $48.
 @MainActor
 enum DemoData {
+    /// Is there any sample data in the store?
+    static func isLoaded(in context: ModelContext) -> Bool {
+        ((try? context.fetch(FetchDescriptor<Receipt>())) ?? []).contains(where: \.isDemo)
+            || ((try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []).contains(where: \.isDemo)
+    }
+
+    /// Removes exactly what `load` added - and nothing you entered yourself.
+    static func remove(from context: ModelContext) {
+        for t in (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? [] where t.isDemo { context.delete(t) }
+        for r in (try? context.fetch(FetchDescriptor<Receipt>())) ?? [] where r.isDemo { Actions.removeReceipt(r, in: context) }
+        for b in (try? context.fetch(FetchDescriptor<BalanceReconciliation>())) ?? [] where b.isDemo { context.delete(b) }
+        for trip in (try? context.fetch(FetchDescriptor<Trip>())) ?? [] where trip.isDemo {
+            for r in (try? context.fetch(FetchDescriptor<Receipt>())) ?? [] where r.trip?.persistentModelID == trip.persistentModelID { r.trip = nil }
+            context.delete(trip)
+        }
+        try? context.save()
+    }
+
     static func load(into context: ModelContext) {
+        guard !isLoaded(in: context) else { return }
         CategorySeeder.seedIfNeeded(in: context)
+        func known() -> (Set<PersistentIdentifier>, Set<PersistentIdentifier>, Set<PersistentIdentifier>, Set<PersistentIdentifier>) {
+            (Set(((try? context.fetch(FetchDescriptor<Receipt>())) ?? []).map(\.persistentModelID)),
+             Set(((try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []).map(\.persistentModelID)),
+             Set(((try? context.fetch(FetchDescriptor<Trip>())) ?? []).map(\.persistentModelID)),
+             Set(((try? context.fetch(FetchDescriptor<BalanceReconciliation>())) ?? []).map(\.persistentModelID)))
+        }
+        let before = known()
+        defer {
+            // whatever appeared during the load is sample data
+            try? context.save()
+            for r in (try? context.fetch(FetchDescriptor<Receipt>())) ?? [] where !before.0.contains(r.persistentModelID) { r.isDemo = true }
+            for t in (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? [] where !before.1.contains(t.persistentModelID) { t.isDemo = true }
+            for t in (try? context.fetch(FetchDescriptor<Trip>())) ?? [] where !before.2.contains(t.persistentModelID) { t.isDemo = true }
+            for b in (try? context.fetch(FetchDescriptor<BalanceReconciliation>())) ?? [] where !before.3.contains(b.persistentModelID) { b.isDemo = true }
+            try? context.save()
+        }
+        // sample items only join the sample trip, never a trip you're really on
+        var sampleTrip: Trip?
         let today = Date().startOfDay
         func ago(_ days: Int) -> Date { Dates.calendar.date(byAdding: .day, value: -days, to: today)! }
         func cat(_ name: String) -> Category? {
@@ -17,7 +54,7 @@ enum DemoData {
         @discardableResult
         func receipt(_ merchant: String, _ original: String?, _ daysAgo: Int, _ currency: String, _ items: [ParsedLineItem], date: Date? = nil) -> Receipt {
             let r = Receipt(merchant: merchant, merchantOriginal: original, date: date ?? ago(daysAgo), currency: currency,
-                            total: round2(items.reduce(0) { $0 + $1.price }), status: .confirmed, rawText: "(demo receipt)", trip: Actions.activeTrip(context))
+                            total: round2(items.reduce(0) { $0 + $1.price }), status: .confirmed, rawText: "(demo receipt)", trip: sampleTrip)
             context.insert(r)
             for (i, parsed) in items.enumerated() {
                 let item = LineItem(name: parsed.name, price: parsed.price, quantity: parsed.quantity, isDeposit: parsed.isDeposit, tags: parsed.tags)
@@ -28,7 +65,7 @@ enum DemoData {
         }
         @discardableResult
         func charge(_ daysAgo: Int, _ description: String, _ sgd: Double, _ local: Double?, _ currency: String?) -> YouTripTransaction {
-            let t = YouTripTransaction(date: ago(daysAgo), description: description, amountSGD: sgd, localAmount: local, localCurrency: currency, trip: Actions.activeTrip(context))
+            let t = YouTripTransaction(date: ago(daysAgo), description: description, amountSGD: sgd, localAmount: local, localCurrency: currency, trip: sampleTrip)
             context.insert(t)
             return t
         }
@@ -56,7 +93,7 @@ enum DemoData {
         link(tCoop, coop, "auto"); link(tPress, press, "approved", "linked manually"); link(tTransit, transit, "auto")
 
         // ---- a weekend in Berlin (EUR): three charges establish the usual rate of about 0.67 EUR per SGD ----
-        let berlin = (try? Actions.createTrip(name: "Berlin weekend", start: ago(16), end: ago(14), activate: false, colorHex: "#ff8a75", emoji: "🗼", in: context))
+        let berlin = (try? Actions.createTrip(name: "Berlin weekend", start: ago(16), end: ago(14), activate: false, colorHex: "#ff8a75", emoji: "trip-london", in: context))
         let cafe = receipt("Cafe Roma", "Cafe Roma", 14, "EUR", [item("Lunch for two", 50, tags: ["food", "meals out"])])
         let bakery = receipt("Backerei Mohr", "Backerei Mohr", 15, "EUR", [item("Bread and pastries", 20, tags: ["food"])])
         let shop = receipt("Museum shop", "Museumsshop", 15, "EUR", [item("Postcards", 30, tags: ["gifts"])])
@@ -89,6 +126,14 @@ enum DemoData {
             }
         }
 
+        // ---- this month so far: some categories running hot against their usual, others quiet, so the chart has shape ----
+        let dayOfMonth = Dates.calendar.component(.day, from: today)
+        func thisMonth(_ daysAgo: Int) -> Int { min(daysAgo, max(0, dayOfMonth - 1)) }
+        receipt("Cold Storage", nil, thisMonth(2), "SGD", [item("Salmon fillet", 22.40, tags: ["food", "meat"]), item("Broccoli", 4.80, tags: ["food", "vege"]), item("Eggs", 6.20, tags: ["food"])])
+        receipt("Ramen Bar", nil, thisMonth(3), "SGD", [item("Ramen set", 17.50, tags: ["food", "meals out"])])
+        receipt("Uniqlo", nil, thisMonth(4), "SGD", [item("Light jacket", 79.90, tags: ["shopping"])])      // well ahead of a usual month's shopping
+        receipt("Guardian", nil, thisMonth(1), "SGD", [item("Plasters", 3.50, tags: ["health"])])          // well under usual
+
         // ---- the user has confirmed some categories; the rest stay suggestions or unknown, so "Needs a look" has content ----
         let confirmed = ["Coffee": "Drinks", "Sandwich": "Eat Out", "Lunch for two": "Eat Out", "Bread and pastries": "Carbs",
                          "Travel card top-up": "Public Transit", "Postcards": "Souvenirs", "Facial napkins": "Household"]
@@ -97,8 +142,10 @@ enum DemoData {
         }
 
         // ---- Trip Mode is on for a Tallinn trip: the latest charges joined it automatically ----
-        if let tallinn = try? Actions.createTrip(name: "Tallinn trip", start: ago(1), end: ago(-4), activate: true, colorHex: "#5d8df6", emoji: "🏰", in: context) {
+        // (switched on only if you aren't already on a real trip)
+        if let tallinn = try? Actions.createTrip(name: "Tallinn trip", start: ago(1), end: ago(-4), activate: Actions.activeTrip(context) == nil, colorHex: "#5d8df6", emoji: "trip-castle", in: context) {
             coop.trip = tallinn; tCoop.trip = tallinn
+            sampleTrip = tallinn.isActive ? tallinn : nil
         }
         charge(1, "RAKVERE KOHVIK TALLINN", 7.20, 5.00, "EUR")
         charge(0, "BOLT TALLINN", 11.80, 8.20, "EUR")

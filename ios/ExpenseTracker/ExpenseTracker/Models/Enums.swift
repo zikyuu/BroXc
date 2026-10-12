@@ -21,6 +21,7 @@ enum TransactionType: String, Codable, CaseIterable {
     case expense                                   // default — an actual purchase
     case reimbursement                             // incoming money reducing what's owed back to the user
     case income                                    // incoming money that isn't a reimbursement (allowance, etc.)
+    case cashback                                  // money back on a purchase (a government/card rebate): lowers spending
     case refund                                    // incoming money reversing an earlier personal expense
     case transferOwnAccount = "transfer_own_account" // cash movement between the user's own accounts
     case other

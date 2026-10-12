@@ -16,6 +16,8 @@ final class BalanceReconciliation {
     var knownThrough: Date?
     /// Which account this check is for. Checks made before there were several are all YouTrip.
     var accountRaw: String = Account.youtrip.rawValue
+    /// Made-up sample data (see `Receipt.isDemo`).
+    var isDemo: Bool = false
 
     var account: Account { Account(rawValue: accountRaw) }
 

@@ -42,7 +42,7 @@ struct CategoryView: View {
         if let category = target.category { return tree.node(for: category) }
         if let owner = target.unsortedOf {
             let own = tree.node(for: owner)
-            return CategoryNode(category: nil, unsortedOf: owner, name: "Unsorted in \(owner.name)", icon: "?", kind: .normal, isUnsorted: true,
+            return CategoryNode(category: nil, unsortedOf: owner, name: "Other \(owner.name.lowercased())", icon: "?", kind: .normal, isUnsorted: true,
                                 colorHex: owner.effectiveColorHex, budget: nil, ownSGD: own?.ownSGD ?? 0, totalSGD: own?.ownSGD ?? 0, count: own?.count ?? 0, children: [])
         }
         return CategoryNode(category: nil, unsortedOf: nil, name: "Unsorted", icon: "?", kind: .normal, isUnsorted: true, colorHex: "a9a39a", budget: nil,
@@ -104,7 +104,7 @@ struct CategoryView: View {
                 CategoryPicker(title: "Move to…", teach: true) { category, remember, similar in
                     let moving = ledger.items.filter { selected.contains($0.id) }
                     Actions.assignCategory(moving, to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
-                    toaster.show("Moved \(moving.count) item\(moving.count == 1 ? "" : "s") to \(category?.name ?? "Unsorted")")
+                    toaster.show(recategorisedMessage(moving.count, to: category?.name))
                     selecting = false; selected = []
                 }
             }
@@ -146,7 +146,6 @@ struct CategoryView: View {
         let tiles = node.children.filter { !($0.totalSGD <= 0 && ($0.kind == .misc || $0.isUnsorted)) }
         if !tiles.isEmpty {
             // the picture: each child as a card holding its own transactions, ready to drag between
-            Text("Hold a transaction and drag it onto another card to move it.").font(.rounded(12)).foregroundStyle(Theme.muted)
             TileBoard(nodes: tiles, items: items, scope: target.scope, ledger: ledger) { openItemID = $0.id }
         } else if tiles.isEmpty {
             EmptyCard(node.isUnsorted ? "These items are in the right area, but not placed any deeper yet. Long-press one to move it."
@@ -167,7 +166,6 @@ struct CategoryView: View {
         let siblings = (node.category?.parent?.children ?? []).filter { $0.persistentModelID != node.category?.persistentModelID }.sorted { $0.sortOrder < $1.sortOrder }
         if parent != nil || !siblings.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Long-press an item, then drop it on:").font(.rounded(12)).foregroundStyle(Theme.muted)
                 FlowChips(parent: parent, siblings: siblings, ledger: ledger)
             }
             .padding(12).frame(maxWidth: .infinity, alignment: .leading)
@@ -178,7 +176,10 @@ struct CategoryView: View {
     @ViewBuilder
     private func itemSection(_ items: [ItemView], _ ledger: Ledger, limit: Int?) -> some View {
         if items.isEmpty { Text("No transactions yet.").font(.rounded(13)).foregroundStyle(Theme.muted) }
-        else {
+        else if limit == nil {
+            // the whole list: lines from the same receipt belong together
+            ReceiptGroupedList(items: items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
+        } else {
             ItemList(items: limit.map { Array(items.prefix($0)) } ?? items, selecting: $selecting, selected: $selected) { openItemID = $0.id }
         }
     }

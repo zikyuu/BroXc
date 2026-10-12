@@ -80,6 +80,7 @@ enum DBSParser {
 
         var type: TransactionType
         var description = name
+        var payee: String?
         if lowered.contains("paylah") || compact(name).hasPrefix("youtrip") {
             type = .transferOwnAccount   // moving your own money between accounts: neither spending nor income
             description = compact(name).hasPrefix("youtrip") ? "YouTrip top-up" : "Top-up to PayLah"
@@ -91,6 +92,7 @@ enum DBSParser {
         } else if let m = payNow.first(in: name), let who = m.group(2) {
             let toSomeone = (m.group(1) ?? "").lowercased() == "to"
             description = (toSomeone ? "PayNow to " : "PayNow from ") + who
+            if toSomeone { payee = who.components(separatedBy: " OTHR").first.map { $0.trimmingCharacters(in: .whitespaces) } }
             type = toSomeone ? .expense : YouTripParser.suggestedType(for: who) == .expense ? .other : YouTripParser.suggestedType(for: who)
         } else if outgoing {
             type = .expense
@@ -98,7 +100,7 @@ enum DBSParser {
             type = YouTripParser.type(for: name, incoming: true)
         }
         return ParsedTransaction(date: date, description: description, amountSGD: amount, localAmount: nil, localCurrency: nil,
-                                 transactionType: type, account: .dbs, isOutflow: outgoing)
+                                 transactionType: type, account: .dbs, isOutflow: outgoing, payee: payee)
     }
 }
 

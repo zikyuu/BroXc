@@ -23,7 +23,7 @@ enum AccountKind: String, CaseIterable, Identifiable {
         switch self { case .bank: "Bank account"; case .savings: "Savings / fixed deposit"; case .wallet: "Wallet (PayLah)"; case .card: "Travel card" }
     }
     var icon: String {
-        switch self { case .bank: "🏦"; case .savings: "💰"; case .wallet: "📱"; case .card: "💳" }
+        switch self { case .bank, .savings: "asset:acct-bank"; case .wallet: "asset:acct-paylah"; case .card: "asset:acct-youtrip" }
     }
 }
 

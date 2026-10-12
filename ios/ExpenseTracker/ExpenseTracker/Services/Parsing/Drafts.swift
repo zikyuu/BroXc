@@ -43,4 +43,6 @@ struct ParsedTransaction: Equatable {
     var account: Account = .youtrip
     /// Money leaving the account. For YouTrip that's every expense; DBS and PayLah say it outright.
     var isOutflow = false
+    /// Who a payment to a person went to ("rayner"); nil for shops.
+    var payee: String?
 }

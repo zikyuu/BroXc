@@ -11,6 +11,8 @@ final class Trip {
     /// Whether Trip Mode is currently on for this trip — new receipts/expenses auto-tag while true.
     /// Only one trip is ever active at once; enforced by TripStore, not by the model itself.
     var isActive: Bool = false
+    /// Made-up sample data (see `Receipt.isDemo`).
+    var isDemo: Bool = false
     var colorHex: String?
     var emoji: String?
 

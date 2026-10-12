@@ -38,7 +38,7 @@ struct SearchView: View {
                         Rows { ForEach(Array(results.receipts.enumerated()), id: \.offset) { _, r in
                             NavigationLink(value: ledger.transactions.first(where: { $0.matchedReceipt?.persistentModelID == r.receipt.persistentModelID }).map(Route.transaction) ?? Route.receipt(r.receipt)) {
                                 HStack(spacing: 12) {
-                                    IconTile(symbol: "🧾", color: Theme.miscColor)
+                                    IconTile(symbol: Art.receipt, color: Theme.miscColor)
                                     VStack(alignment: .leading) { Text(r.receipt.merchant ?? "Receipt").font(.rounded(15, .semibold))
                                         Text("\(r.receipt.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "") · \(r.matched) item\(r.matched == 1 ? "" : "s") matched").font(.rounded(12)).foregroundStyle(Theme.muted) }
                                     Spacer()
@@ -50,7 +50,7 @@ struct SearchView: View {
                         SectionTitle("Trips")
                         Rows { ForEach(results.trips) { trip in
                             NavigationLink(value: Route.trip(trip)) {
-                                HStack(spacing: 12) { IconTile(symbol: trip.emoji ?? "🧳", color: trip.tint); VStack(alignment: .leading) { Text(trip.name).font(.rounded(15, .semibold)); Text(trip.dateRange).font(.rounded(12)).foregroundStyle(Theme.muted) }; Spacer() }
+                                HStack(spacing: 12) { TripCover(trip: trip, radius: 10).frame(width: 40, height: 40); VStack(alignment: .leading) { Text(trip.name).font(.rounded(15, .semibold)); Text(trip.dateRange).font(.rounded(12)).foregroundStyle(Theme.muted) }; Spacer() }
                                     .padding(.horizontal, 14).padding(.vertical, 12).rowDivider()
                             }.buttonStyle(.plain)
                         } }.flushCard()
@@ -83,7 +83,7 @@ struct TrendsView: View {
                 HStack { ForEach(Range.allCases, id: \.self) { r in
                     Button { range = r } label: {
                         Text(r.rawValue).font(.rounded(13, .semibold)).padding(.horizontal, 14).padding(.vertical, 6)
-                            .foregroundStyle(range == r ? .white : Theme.muted).background(range == r ? Theme.accent : Theme.surface, in: Capsule()).overlay { Capsule().stroke(Theme.line) }
+                            .foregroundStyle(range == r ? Theme.onAccent : Theme.muted).background(range == r ? Theme.accent : Theme.surface, in: Capsule()).overlay { Capsule().stroke(Theme.line) }
                     }
                 } }
                 VStack(alignment: .leading, spacing: 12) {
@@ -113,10 +113,9 @@ struct TrendsView: View {
                             }.padding(.horizontal, 16).padding(.vertical, 12).rowDivider()
                         }.buttonStyle(.plain)
                     } }.flushCard()
-                    if d.usualMonthly != nil { Text("Changes are against your usual, scaled to how much of the month has passed.").font(.rounded(12)).foregroundStyle(Theme.muted) }
                 }
                 SectionTitle("Which days you spend")
-                VStack(alignment: .leading, spacing: 6) { WeekdayBars(points: d.weekdays); Text("Average per day, over the chosen range.").font(.rounded(12)).foregroundStyle(Theme.muted) }.card()
+                VStack(alignment: .leading, spacing: 6) { WeekdayBars(points: d.weekdays) }.card()
                 if !d.recurring.isEmpty {
                     SectionTitle("Looks recurring")
                     Rows { ForEach(d.recurring) { r in
@@ -128,7 +127,7 @@ struct TrendsView: View {
                     SectionTitle("Trips over time")
                     Rows { ForEach(d.trips) { t in
                         NavigationLink(value: Route.trip(t.trip)) {
-                            HStack(spacing: 12) { IconTile(symbol: t.trip.emoji ?? "🧳", color: t.trip.tint, size: 34)
+                            HStack(spacing: 12) { TripCover(trip: t.trip, radius: 10).frame(width: 34, height: 34)
                                 VStack(alignment: .leading) { Text(t.trip.name).font(.rounded(15, .semibold)); Text(t.trip.startDate?.formatted(.dateTime.day().month(.abbreviated).year()) ?? "").font(.rounded(12)).foregroundStyle(Theme.muted) }
                                 Spacer(); Text(Money.whole(t.spend)).font(.rounded(15, .bold)); Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.mutedLine)
                             }.padding(.horizontal, 16).padding(.vertical, 12).rowDivider()
@@ -153,7 +152,7 @@ struct ReviewView: View {
     @Environment(Toaster.self) private var toaster
     @State private var scope = Scope.month
     @State private var confirmAll = false
-    @State private var moving: String?
+    @State private var moving: [String]?
 
     var body: some View {
         WithLedger { ledger in
@@ -172,7 +171,7 @@ struct ReviewView: View {
                     SectionTitle("\(d.matches.count) match\(d.matches.count == 1 ? "" : "es") to check")
                     Rows { ForEach(d.matches) { t in
                         NavigationLink(value: Route.transaction(t)) {
-                            HStack(spacing: 12) { IconTile(symbol: "🔗", color: Theme.warn)
+                            HStack(spacing: 12) { IconTile(symbol: Art.link, color: Theme.warn)
                                 VStack(alignment: .leading) { Text(t.transactionDescription ?? "Charge").font(.rounded(15, .semibold)); Text(t.matchNote ?? "Linked to a receipt, not certain").font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1) }
                                 Spacer(); Text(Money.string(t.amountSGD)).font(.rounded(15, .bold)) }
                                 .padding(.horizontal, 14).padding(.vertical, 12).rowDivider()
@@ -181,24 +180,80 @@ struct ReviewView: View {
                 }
                 if !d.items.isEmpty {
                     SectionTitle("Biggest first")
-                    ForEach(d.items.prefix(40)) { item in card(item, ledger) }
-                    if d.items.count > 40 { Text("\(d.items.count - 40) smaller ones not shown. They’re fine to leave.").font(.rounded(12)).foregroundStyle(Theme.muted).frame(maxWidth: .infinity) }
-                } else if d.matches.isEmpty { EmptyCard("All clear", "Nothing needs a look right now.") }
+                    let groups = groupedByReceipt(d.items)
+                    ForEach(groups.prefix(25)) { group in groupCard(group, ledger) }
+                    if groups.count > 25 { Text("\(groups.count - 25) smaller ones not shown. They’re fine to leave.").font(.rounded(12)).foregroundStyle(Theme.muted).frame(maxWidth: .infinity) }
+                } else if d.matches.isEmpty { EmptyCard("All clear", "Nothing needs a look right now.", mascot: "expr-happy") }
             }
             .confirmationDialog("Confirm all \(suggestions.count) suggested categories? Only do this if the guesses look right to you.", isPresented: $confirmAll, titleVisibility: .visible) {
                 Button("Confirm all") { Actions.acceptSuggestions(suggestions, ledger: ledger, in: context); toaster.show("Confirmed \(suggestions.count)") }
             }
             .sheet(isPresented: Binding(get: { moving != nil }, set: { if !$0 { moving = nil } })) {
-                if let id = moving, let item = ledger.items.first(where: { $0.id == id }) {
-                    CategoryPicker(title: "Move to…", selected: item.category, teach: true) { category, remember, similar in
+                if let ids = moving {
+                    let chosen = ledger.items.filter { ids.contains($0.id) }
+                    CategoryPicker(title: chosen.count > 1 ? "Move all \(chosen.count) to…" : "Move to…", selected: chosen.count == 1 ? chosen[0].category : nil, teach: true) { category, remember, similar in
                         guard let category else { return }
-                        Actions.assignCategory([item], to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
-                        toaster.show("Moved to \(category.name)")
+                        Actions.assignCategory(chosen, to: category, alsoSimilar: similar, remember: remember, ledger: ledger, in: context)
+                        toaster.show(recategorisedMessage(chosen.count, to: category.name))
                     }
                 }
             }
         }
         .navigationTitle("Needs a look").navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// Everything from one shop visit together, biggest visit first.
+    private struct Group: Identifiable {
+        let id: String
+        let items: [ItemView]
+        var total: Double { items.reduce(0) { $0 + ($1.personalSGD ?? 0) } }
+    }
+
+    private func groupedByReceipt(_ items: [ItemView]) -> [Group] {
+        let keyed = Dictionary(grouping: items) { item in item.receipt.map { "r-\($0.persistentModelID.hashValue)" } ?? item.id }
+        return keyed.map { Group(id: $0.key, items: $0.value.sorted { ($0.personalSGD ?? 0) > ($1.personalSGD ?? 0) }) }
+            .sorted { $0.total > $1.total }
+    }
+
+    @ViewBuilder
+    private func groupCard(_ group: Group, _ ledger: Ledger) -> some View {
+        if group.items.count == 1, let only = group.items.first { card(only, ledger) }
+        else {
+            let first = group.items[0]
+            let suggestions = group.items.filter { $0.confidence == .suggested }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(first.merchant ?? "Unknown store").font(.rounded(16, .bold))
+                        Text("\(first.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "") · \(group.items.count) items").font(.rounded(12)).foregroundStyle(Theme.muted)
+                    }
+                    Spacer(); Text(Money.string(group.total)).font(.rounded(16, .bold))
+                }
+                HStack(spacing: 8) {
+                    Button("Set all…") { moving = group.items.map(\.id) }.buttonStyle(.bordered).controlSize(.small)
+                    if suggestions.count > 1 {
+                        Button("Confirm \(suggestions.count) guesses") { Actions.acceptSuggestions(suggestions, ledger: ledger, in: context); toaster.show("Confirmed \(suggestions.count)") }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                    }
+                }
+                VStack(spacing: 0) {
+                    ForEach(group.items) { item in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .top) {
+                                Text(item.name).font(.rounded(14, .semibold)).lineLimit(2)
+                                Spacer(); Text(Money.string(item.personalSGD)).font(.rounded(14, .bold))
+                            }
+                            HStack {
+                                CategoryChip(category: item.category, confidence: item.confidence)
+                                Spacer()
+                                if item.confidence == .suggested { Button("Yes") { Actions.acceptSuggestions([item], ledger: ledger, in: context); toaster.show("Confirmed") }.buttonStyle(.borderedProminent).controlSize(.mini) }
+                                Button(item.confidence == .suggested ? "Change" : "Choose") { moving = [item.id] }.buttonStyle(.bordered).controlSize(.mini)
+                            }
+                        }.padding(.vertical, 10).rowDivider()
+                    }
+                }
+            }.card(padding: 14)
+        }
     }
 
     private func card(_ item: ItemView, _ ledger: Ledger) -> some View {
@@ -214,7 +269,7 @@ struct ReviewView: View {
                 CategoryChip(category: item.category, confidence: item.confidence, full: true)
                 Spacer()
                 if item.confidence == .suggested { Button("Yes") { Actions.acceptSuggestions([item], ledger: ledger, in: context); toaster.show("Confirmed") }.buttonStyle(.borderedProminent).controlSize(.small) }
-                Button(item.confidence == .suggested ? "Change" : "Choose") { moving = item.id }.buttonStyle(.bordered).controlSize(.small)
+                Button(item.confidence == .suggested ? "Change" : "Choose") { moving = [item.id] }.buttonStyle(.bordered).controlSize(.small)
             }
         }.card(padding: 14)
     }
@@ -250,8 +305,6 @@ struct BalanceView: View {
                             .font(.rounded(12)).foregroundStyle(Theme.muted)
                     } else {
                         Text("Check your real \(ledger.info(account).name) balance now and then").font(.rounded(16, .bold))
-                        Text("Enter what \(ledger.info(account).name) actually shows. The first check is a starting point; later ones reveal money the records can’t explain.").font(.rounded(13)).foregroundStyle(Theme.muted)
-                        if !tracked { Text("\(ledger.info(account).name) screenshots can’t be imported yet, so for now this just keeps its balance visible on Home.").font(.rounded(12)).foregroundStyle(Theme.muted) }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).card()
                 VStack(alignment: .leading, spacing: 12) {
@@ -301,7 +354,7 @@ extension BalanceView {
         if !waiting.isEmpty || !missing.isEmpty || !paired.isEmpty {
             SectionTitle("Moves between your accounts")
             VStack(alignment: .leading, spacing: 8) {
-                if !paired.isEmpty { Text("✓ \(paired.count) matched on both sides").font(.rounded(13)) }
+                if !paired.isEmpty { Label("\(paired.count) matched on both sides", systemImage: "checkmark.circle.fill").font(.rounded(13)) }
                 ForEach(waiting) { t in
                     NavigationLink(value: Route.transaction(t)) {
                         Text("⏳ \(Money.string(abs(t.amountSGD ?? 0))) \(t.isOutflow ? "out of" : "into") \(ledger.info(t.account).name) on \(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"): waiting for the other account").font(.rounded(13)).foregroundStyle(Theme.muted)
@@ -309,7 +362,7 @@ extension BalanceView {
                 }
                 ForEach(missing) { t in
                     NavigationLink(value: Route.transaction(t)) {
-                        Text("⚠️ \(Money.string(abs(t.amountSGD ?? 0))) \(t.isOutflow ? "out of" : "into") \(ledger.info(t.account).name) on \(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"): no matching move in your other accounts").font(.rounded(13))
+                        Label("\(Money.string(abs(t.amountSGD ?? 0))) \(t.isOutflow ? "out of" : "into") \(ledger.info(t.account).name) on \(t.date?.formatted(.dateTime.day().month(.abbreviated)) ?? "?"): no matching move in your other accounts", systemImage: "exclamationmark.triangle.fill").font(.rounded(13))
                     }.buttonStyle(.plain)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).card()
@@ -327,7 +380,6 @@ struct CategoriesView: View {
     var body: some View {
         let ordered = flatten(all.filter { $0.parent == nil }.sorted { $0.sortOrder < $1.sortOrder })
         Screen {
-            Text("Organise spending your way. Categories nest as deep as you like. A budget sets the green line on your spending map.").font(.rounded(13)).foregroundStyle(Theme.muted)
             Rows { ForEach(ordered, id: \.persistentModelID) { c in
                 HStack(spacing: 10) {
                     IconTile(symbol: c.icon, color: Color(hex: c.effectiveColorHex), size: 30)
@@ -374,13 +426,12 @@ struct AddView: View {
     var body: some View {
         Screen {
             if let trip = trips.first(where: \.isActive) {
-                Text("🧳  New items will join \(trip.name)").font(.rounded(14, .semibold)).frame(maxWidth: .infinity, alignment: .leading)
+                Label("New items will join \(trip.name)", systemImage: "suitcase.fill").font(.rounded(14, .semibold)).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12).background(Theme.greenBg, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
             receiptCard
             VStack(alignment: .leading, spacing: 10) {
                 Text("Transactions").font(.rounded(17, .bold))
-                Text("Screenshot the transaction list from YouTrip, PayLah or your DBS account history: the app works out which one it is. Overlapping screenshots are fine: ones you’ve already saved are skipped.").font(.rounded(13)).foregroundStyle(Theme.muted)
                 PhotosPicker(selection: $youtripPick, matching: .images) { pickerLabel("Choose screenshot", systemImage: "photo") }
                 if working == "youtrip" { ProgressView("Reading the image…") }
                 if let youtripResult { Text(youtripResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
@@ -413,9 +464,8 @@ struct AddView: View {
             if let receiptResult { Text(receiptResult).font(.rounded(13)).foregroundStyle(Theme.muted) }
             DisclosureGroup("Already have a Google Translate screenshot?") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Add the translated screenshot, and the original photo too if you can: its store name helps match the charge.").font(.rounded(13)).foregroundStyle(Theme.muted)
-                    PhotosPicker(selection: $receiptPick, matching: .images) { pickerLabel(receiptPick == nil ? "Translated screenshot" : "Translated screenshot ✓", systemImage: "doc.text.image") }
-                    PhotosPicker(selection: $originalPick, matching: .images) { pickerLabel(originalPick == nil ? "Original photo (optional)" : "Original photo ✓", systemImage: "camera") }
+                    PhotosPicker(selection: $receiptPick, matching: .images) { pickerLabel(receiptPick == nil ? "Translated screenshot" : "Translated screenshot added", systemImage: "doc.text.image") }
+                    PhotosPicker(selection: $originalPick, matching: .images) { pickerLabel(originalPick == nil ? "Original photo (optional)" : "Original photo added", systemImage: "camera") }
                     PrimaryButton(title: "Read translated screenshot", disabled: receiptPick == nil || working != nil) { Task { await readTranslatedScreenshot() } }
                 }.padding(.top, 8)
             }
@@ -442,7 +492,7 @@ struct AddView: View {
             Actions.relinkTransfers(in: context)
             let matches = Matcher.run(in: context)
             let from = Actions.accountName(parsed.first?.account ?? .youtrip, in: context)
-            youtripResult = "\(from): found \(parsed.count) transaction\(parsed.count == 1 ? "" : "s"), \(saved.added) new, \(saved.skipped) already saved. \(matches.count) receipt\(matches.count == 1 ? "" : "s") linked."
+            youtripResult = "\(from): found \(parsed.count) transaction\(parsed.count == 1 ? "" : "s"), \(saved.added) new, \(saved.skipped) already saved\(Actions.lastRepairCount > 0 ? " (\(Actions.lastRepairCount) corrected)" : ""). \(matches.count) receipt\(matches.count == 1 ? "" : "s") linked."
         } catch { toaster.show(error.localizedDescription, error: true) }
     }
 
@@ -491,7 +541,7 @@ struct AddView: View {
 
     /// A receipt is in: go to Activity (where it now is) instead of leaving you on this page.
     private func finishAdding(_ draft: ReceiptDraft, matched: Matcher.Result?) {
-        toaster.show("Added \(draft.merchant ?? "receipt"): \(draft.items.count) item\(draft.items.count == 1 ? "" : "s")" + (matched != nil ? ", linked ✓" : ", no charge yet")
+        toaster.show("Added \(draft.merchant ?? "receipt"): \(draft.items.count) item\(draft.items.count == 1 ? "" : "s")" + (matched != nil ? ", linked" : ", no charge yet")
                      + (draft.repairs.isEmpty ? "" : " · fixed \(draft.repairs.count) unclear price\(draft.repairs.count == 1 ? "" : "s") from the total"))
         dismiss()
         navigation.selectedTab = .activity
@@ -508,31 +558,63 @@ struct AddView: View {
 struct MoreView: View {
     @Environment(\.modelContext) private var context
     @Environment(Toaster.self) private var toaster
+    @AppStorage("appearance") private var appearance = "system"
     @State private var confirmErase = false
+    @State private var shareURL: URL?
+    @State private var importing = false
+    @State private var pendingImport: Data?
 
     var body: some View {
         Screen {
             Rows {
-                link(.add, "📥", "Add screenshots", "YouTrip, PayLah, DBS and receipts")
-                link(.review, "👀", "Needs a look", "Optional: confirm the app’s guesses")
-                link(.search, "🔎", "Search", "Items, merchants, categories, trips")
+                link(.help, Art.help, "Help", "Where to find things and how they work")
+                link(.categories, Art.categories, "Categories", "Rename, reorder and colour")
+                link(.budgets, Art.budget, "Budgets", "A total budget and one for each category")
             }.flushCard()
             Rows {
-                link(.trends, "📈", "Trends", "Monthly patterns, usual vs now")
-                link(.balance, "⚖️", "Balance check", "Find money the records can’t explain")
-                link(.accounts, "🏦", "Accounts", "Your DBS accounts, PayLah, YouTrip and more")
-                link(.categories, "🗂️", "Categories", "Your own hierarchy and budgets")
+                HStack {
+                    Text("Appearance").font(.rounded(15))
+                    Spacer()
+                    Picker("Appearance", selection: $appearance) {
+                        Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark")
+                    }.pickerStyle(.segmented).frame(maxWidth: 220)
+                }.padding(.horizontal, 16).padding(.vertical, 12)
             }.flushCard()
             Rows {
-                Button { DemoData.load(into: context); toaster.show("Sample data loaded") } label: { MenuRow("Load sample data", hint: "Adds made-up spending so you can explore", chevron: false) }.buttonStyle(.plain)
+                Button { exportData() } label: { MenuRow("Export my data", hint: "Save a backup file, photos included", chevron: false) }.buttonStyle(.plain)
+                Button { importing = true } label: { MenuRow("Import a backup", hint: "Replace what’s on this phone with a backup file", chevron: false) }.buttonStyle(.plain)
+            }.flushCard()
+            Rows {
+                if DemoData.isLoaded(in: context) {
+                    Button { DemoData.remove(from: context); toaster.show("Sample data removed") } label: { MenuRow("Remove sample data", hint: "Takes out only the made-up spending, nothing of yours", chevron: false) }.buttonStyle(.plain)
+                } else {
+                    Button { DemoData.load(into: context); toaster.show("Sample data loaded") } label: { MenuRow("Load sample data", hint: "Adds made-up spending so you can explore. You can remove it again", chevron: false) }.buttonStyle(.plain)
+                }
                 Button { confirmErase = true } label: { MenuRow("Erase all data", hint: "Removes everything you’ve tracked on this phone", chevron: false).foregroundStyle(Theme.bad) }.buttonStyle(.plain)
             }.flushCard()
-            Text("Everything stays on this phone. No account, no cloud, no tracking.").font(.rounded(12)).foregroundStyle(Theme.muted).frame(maxWidth: .infinity)
         }
         .navigationTitle("More").navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Erase everything you’ve tracked on this phone? This can’t be undone.", isPresented: $confirmErase, titleVisibility: .visible) {
             Button("Erase everything", role: .destructive) { Actions.eraseEverything(in: context); toaster.show("All data erased") }
         }
+        .sheet(isPresented: Binding(get: { shareURL != nil }, set: { if !$0 { shareURL = nil } })) { if let shareURL { ShareSheet(items: [shareURL]) } }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
+            guard case .success(let url) = result else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            if let data = try? Data(contentsOf: url) { pendingImport = data } else { toaster.show("That file couldn’t be opened.", error: true) }
+        }
+        .confirmationDialog("Replace everything on this phone with this backup? What’s here now will be gone.", isPresented: Binding(get: { pendingImport != nil }, set: { if !$0 { pendingImport = nil } }), titleVisibility: .visible) {
+            Button("Replace with backup", role: .destructive) {
+                guard let data = pendingImport else { return }
+                do { try DataExport.restore(data, into: context); toaster.show("Backup restored") } catch { toaster.show(error.localizedDescription, error: true) }
+                pendingImport = nil
+            }
+        }
+    }
+
+    private func exportData() {
+        do { shareURL = try DataExport.makeBackupFile(from: context) } catch { toaster.show("Couldn’t make the backup: \(error.localizedDescription)", error: true) }
     }
 
     private func link(_ route: Route, _ emoji: String, _ title: String, _ hint: String) -> some View {
@@ -564,14 +646,19 @@ struct AccountsView: View {
                 Rows {
                     ForEach(accounts) { account in
                         Button { editing = account } label: {
-                            MenuRow("\(account.kind.icon) \(account.name)", hint: [account.kind.label, account.number].compactMap { $0 }.joined(separator: " · ")) {
-                                Text(ledger.currentBalance(for: Account(rawValue: account.key)).map { Money.whole($0.implied) } ?? "no balance").font(.rounded(14, .bold))
-                            }
+                            HStack(spacing: 12) {
+                                Glyph(symbol: account.kind.icon, size: 26).frame(width: 40, height: 40)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(account.name).font(.rounded(15, .semibold)).foregroundStyle(Theme.text)
+                                    Text([account.kind.label, account.number].compactMap { $0 }.joined(separator: " · ")).font(.rounded(12)).foregroundStyle(Theme.muted).lineLimit(1)
+                                }
+                                Spacer()
+                                Text(ledger.currentBalance(for: Account(rawValue: account.key)).map { Money.whole($0.implied) } ?? "no balance").font(.rounded(14, .bold)).foregroundStyle(Theme.text)
+                            }.padding(.horizontal, 14).padding(.vertical, 10).rowDivider()
                         }.buttonStyle(.plain)
                         .reorderableAccount(account.key)
                     }
                 }.flushCard()
-                Text("Press and hold an account, then drag it where you want it. The order here is the order on Home.").font(.rounded(12)).foregroundStyle(Theme.muted)
                 PrimaryButton(title: "Add an account") { adding = true }
             }
         }
@@ -628,5 +715,69 @@ struct AccountEditSheet: View {
             .onAppear { if let account { name = account.name; kind = account.kind; number = account.number ?? "" } }
         }
         .presentationDetents([.large])
+    }
+}
+
+// MARK: - Budgets
+
+/// One place for every budget: a total for the month, and one per category. With a total set the Home pace ring is judged against it;
+/// without one, the category budgets added up, and without those, your usual month.
+struct BudgetsView: View {
+    @Environment(\.modelContext) private var context
+    @AppStorage("totalBudget") private var totalBudget = 0.0
+    @State private var totalText = ""
+    @Query(sort: \Category.sortOrder) private var categories: [Category]
+
+    private var ordered: [Category] {
+        func walk(_ parent: Category?) -> [Category] {
+            categories.filter { $0.parent?.persistentModelID == parent?.persistentModelID && $0.kind != .deposit }
+                .sorted { $0.sortOrder < $1.sortOrder }.flatMap { [$0] + walk($0) }
+        }
+        return walk(nil)
+    }
+
+    var body: some View {
+        Screen {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Total monthly budget").font(.rounded(13, .semibold)).foregroundStyle(Theme.muted)
+                HStack {
+                    Text("$").font(.rounded(26, .heavy))
+                    TextField("No total budget", text: $totalText).keyboardType(.decimalPad).font(.rounded(26, .heavy))
+                        .onChange(of: totalText) { _, new in totalBudget = Double(new.replacingOccurrences(of: ",", with: ".")) ?? 0 }
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).card()
+            SectionTitle("By category")
+            Rows {
+                ForEach(ordered) { category in
+                    BudgetRow(category: category)
+                }
+            }.flushCard()
+        }
+        .navigationTitle("Budgets").navigationBarTitleDisplayMode(.inline)
+        .onAppear { totalText = totalBudget > 0 ? totalBudget.formatted(.number.grouping(.never)) : "" }
+    }
+}
+
+private struct BudgetRow: View {
+    let category: Category
+    @Environment(\.modelContext) private var context
+    @State private var text = ""
+    @State private var loaded = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            IconTile(symbol: category.icon, color: Color(hex: category.effectiveColorHex), size: 30)
+            Text(category.name).font(.rounded(15)).lineLimit(1)
+            Spacer()
+            Text("$").foregroundStyle(Theme.muted)
+            TextField("none", text: $text).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 80).font(.rounded(15, .semibold))
+                .onChange(of: text) { _, new in
+                    guard loaded else { return }
+                    category.budgetSGD = Double(new.replacingOccurrences(of: ",", with: "."))
+                    try? context.save()
+                }
+        }
+        .padding(.leading, CGFloat(category.depth) * 18 + 14).padding(.trailing, 14).padding(.vertical, 8).rowDivider()
+        .onAppear { text = category.budgetSGD.map { $0.formatted(.number.grouping(.never)) } ?? ""; loaded = true }
     }
 }

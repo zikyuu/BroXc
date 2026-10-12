@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import UIKit
 
 struct AppError: LocalizedError {
     let message: String
@@ -72,6 +73,12 @@ enum Actions {
             if !Dates.calendar.isDate(newDate, inSameDayAs: oldDate) { return false }
         } else { dateUnknown = true }
 
+        // a payment to a person on the same day for the same amount, where the stored text is a garbled version of its name
+        // ("...Mobile no. ending", "5455) spain accoms"): the same payment, read badly the first time
+        if !dateUnknown, let payee = row.payee {
+            let stored = (old.transactionDescription ?? "").lowercased()
+            if stored.contains(String(payee.lowercased().prefix(4))) || stored.contains("mobile no") || stored.contains("ending") { return true }
+        }
         let a = (row.description ?? "").trimmingCharacters(in: .whitespaces), b = (old.transactionDescription ?? "").trimmingCharacters(in: .whitespaces)
         if a.isEmpty || b.isEmpty { return !dateUnknown }   // nothing to compare names on: only trust it with a known date
         // a missing date is the weaker evidence, so ask more of the name
@@ -81,16 +88,27 @@ enum Actions {
     /// Saves parsed transactions, skipping ones already stored. Screenshots overlap when you scroll, but two identical
     /// rows can also be genuine (two 10 kr rides in a day) - so each saved charge can account for only ONE row of the
     /// upload: the first N identical rows match the N copies already held, and a further one is genuinely new.
+    /// How many stored payments the last `saveNew` corrected.
+    private(set) static var lastRepairCount = 0
+
     static func saveNew(_ parsed: [ParsedTransaction], in context: ModelContext) -> (added: Int, skipped: Int) {
         let existing = (try? context.fetch(FetchDescriptor<YouTripTransaction>())) ?? []
         var claimed = Set<PersistentIdentifier>()
         let trip = activeTrip(context)
-        var added = 0, skipped = 0
+        var added = 0, skipped = 0, repaired = 0
+        defer { lastRepairCount = repaired }
         for row in parsed {
             // prefer a dated match over a date-less one when both could fit
             let candidates = existing.filter { !claimed.contains($0.persistentModelID) && isSameCharge(row, as: $0) }
             if let match = candidates.first(where: { $0.date != nil && row.date != nil }) ?? candidates.first {
                 claimed.insert(match.persistentModelID)
+                // the same payment to a person read again, now with the right name (an earlier read could have mixed up which
+                // text belongs to which payment): correct the stored one rather than keep the wrong text
+                if let payee = row.payee, let description = row.description, match.transactionDescription != description {
+                    match.transactionDescription = description
+                    match.payee = payee
+                    repaired += 1
+                }
                 skipped += 1
                 continue
             }
@@ -99,6 +117,7 @@ enum Actions {
                                        transactionType: row.transactionType, trip: row.transactionType == .expense ? trip : nil)
             t.account = row.account
             t.isOutflow = row.isOutflow
+            t.payee = row.payee
             context.insert(t)
             added += 1
         }
@@ -243,7 +262,8 @@ enum Actions {
     @discardableResult
     static func manualItem(for t: YouTripTransaction, guess: Category? = nil, in context: ModelContext) -> LineItem {
         if let receipt = t.matchedReceipt, let first = receipt.lineItems.min(by: { $0.position < $1.position }) { return first }
-        let amount = t.localAmount ?? t.amountSGD ?? 0
+        var amount = t.localAmount ?? t.amountSGD ?? 0
+        if t.transactionType == .cashback { amount = -abs(amount) }   // cashback is spending in reverse
         let receipt = Receipt(merchant: t.transactionDescription, date: t.date, currency: t.localCurrency ?? "SGD",
                               total: amount, status: .confirmed, trip: t.trip)
         context.insert(receipt)
@@ -266,6 +286,55 @@ enum Actions {
         context.insert(item)
         try? context.save()
         return item
+    }
+
+    /// Sets what kind of visit a receipt was, without touching the categories of its lines.
+    static func setVisitCategory(_ receipt: Receipt, _ category: Category?, in context: ModelContext) {
+        receipt.visitCategory = category
+        try? context.save()
+    }
+
+    /// Ignore the current difference between a receipt's lines and its printed total.
+    static func waiveGap(_ receipt: Receipt, in context: ModelContext) {
+        guard let gap = receipt.unexplainedAmount else { return }
+        receipt.waivedGap = gap
+        try? context.save()
+    }
+
+    static func unwaiveGap(_ receipt: Receipt, in context: ModelContext) {
+        receipt.waivedGap = nil
+        try? context.save()
+    }
+
+    /// Changes what a receipt line costs, in the receipt's own currency.
+    static func setLinePrice(_ item: ItemView, to price: Double, in context: ModelContext) throws {
+        guard let line = item.lineItem else { throw AppError("Only a line read from a receipt can be edited.") }
+        line.price = round2(price)
+        // an edited price replaces any discount arithmetic that produced the old one
+        line.originalPrice = nil; line.discount = nil
+        try? context.save()
+    }
+
+    /// Deletes receipt lines (and the bottle deposits that were paid with them). Lines of a charge with no receipt can't be deleted.
+    @discardableResult
+    static func deleteLines(_ items: [ItemView], in context: ModelContext) -> Int {
+        let lines = items.compactMap(\.lineItem)
+        let uids = Set(lines.map(\.uid))
+        var removed = 0
+        for line in lines {
+            for share in line.shares { context.delete(share) }
+            context.delete(line)
+            removed += 1
+        }
+        for other in (try? context.fetch(FetchDescriptor<LineItem>())) ?? [] {
+            if let parent = other.parentUID, uids.contains(parent) {
+                for share in other.shares { context.delete(share) }
+                context.delete(other)
+                removed += 1
+            }
+        }
+        try? context.save()
+        return removed
     }
 
     /// Writes the outcome of a re-read into a saved receipt without disturbing anything already there: lines it had are
@@ -295,6 +364,15 @@ enum Actions {
         return (added, fixed)
     }
 
+    /// Attaches, replaces or (with nil) removes the photo on an item. A charge with no receipt gets its one-line item first.
+    static func setPhoto(_ image: UIImage?, on item: ItemView, in context: ModelContext) {
+        let line = lineItem(for: item, in: context)
+        let old = line.photoPath
+        line.photoPath = image.flatMap { ImageLoader.storePhoto($0) }
+        if old != line.photoPath { ImageLoader.delete(old) }
+        try? context.save()
+    }
+
     static func lineItem(for item: ItemView, in context: ModelContext) -> LineItem {
         if let real = item.lineItem { return real }
         let guess = item.confidence == .suggested ? item.category : nil
@@ -307,6 +385,15 @@ enum Actions {
                                remember: Bool = false, ledger: Ledger, in context: ModelContext) {
         var names: [String] = []
         for view in items {
+            // a cost someone else paid is its own record; and moving the "unaccounted" remainder into a category logs it as a cost
+            if let uid = view.sharedCostID {
+                if let cost = (try? context.fetch(FetchDescriptor<SharedCost>()))?.first(where: { $0.uid == uid }) { cost.category = category }
+                continue
+            }
+            if view.id.hasPrefix("unacc-") {
+                if let category { context.insert(SharedCost(title: "Reimbursement not itemised yet", amountSGD: view.price, date: view.date, category: category, trip: view.trip)) }
+                continue
+            }
             let line = lineItem(for: view, in: context)
             line.category = category
             // remembered by the name as printed: translations of the same product can vary, the printed text doesn't
@@ -314,7 +401,8 @@ enum Actions {
         }
         if alsoSimilar, let category {
             let wanted = Set(names.map(ItemRule.key))
-            for other in ledger.items where other.confidence != .confirmed && wanted.contains(ItemRule.key(other.lineItem?.originalName ?? other.name)) {
+            for other in ledger.items where other.confidence != .confirmed && (other.lineItem != nil || (other.transaction != nil && other.sharedCostID == nil && !other.id.hasPrefix("unacc-")))
+                && wanted.contains(ItemRule.key(other.lineItem?.originalName ?? other.name)) {
                 lineItem(for: other, in: context).category = category
             }
         }
@@ -454,6 +542,39 @@ enum Actions {
         context.insert(MoneyInLabel(name: clean, sortOrder: existing.count))
         try? context.save()
         return clean
+    }
+
+    /// Marks (or, with nil, unmarks) a payment as money sent to a person.
+    static func setPayee(_ t: YouTripTransaction, _ name: String?, in context: ModelContext) {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        t.payee = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        try? context.save()
+    }
+
+    // MARK: shared costs
+
+    @discardableResult
+    static func addSharedCost(title: String, amount: Double, date: Date?, remark: String?, person: String?, category: Category?, trip: Trip, in context: ModelContext) throws -> SharedCost {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw AppError("Say what it was.") }
+        guard amount > 0 else { throw AppError("Enter what you owe for it.") }
+        let cost = SharedCost(title: clean, amountSGD: round2(amount), date: date, remark: remark?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                              person: person?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty, category: category, trip: trip)
+        context.insert(cost)
+        try? context.save()
+        return cost
+    }
+
+    /// Puts a logged cost on another day of the trip (or, with nil, on no particular day).
+    static func moveSharedCost(uid: String, to day: Date?, in context: ModelContext) {
+        guard let cost = ((try? context.fetch(FetchDescriptor<SharedCost>())) ?? []).first(where: { $0.uid == uid }) else { return }
+        cost.date = day?.startOfDay
+        try? context.save()
+    }
+
+    static func deleteSharedCost(_ cost: SharedCost, in context: ModelContext) {
+        context.delete(cost)
+        try? context.save()
     }
 
     static func setNote(_ t: YouTripTransaction, _ note: String?, in context: ModelContext) {
@@ -629,9 +750,12 @@ enum Actions {
 
     /// Wipes all tracked data (not the starter categories' existence - they're re-seeded when empty).
     static func eraseEverything(in context: ModelContext) {
+        // photos and receipt images live on disk beside the data, so they go too
+        for line in (try? context.fetch(FetchDescriptor<LineItem>())) ?? [] { ImageLoader.delete(line.photoPath) }
+        for receipt in (try? context.fetch(FetchDescriptor<Receipt>())) ?? [] { ImageLoader.delete(receipt.sourceImagePath) }
         func wipe<T: PersistentModel>(_ type: T.Type) { for row in (try? context.fetch(FetchDescriptor<T>())) ?? [] { context.delete(row) } }
         wipe(LineItemShare.self); wipe(LineItem.self); wipe(YouTripTransaction.self); wipe(Receipt.self)
-        wipe(ItemRule.self); wipe(BalanceReconciliation.self); wipe(BalanceCheckpoint.self); wipe(Trip.self)
+        wipe(SharedCost.self); wipe(ItemRule.self); wipe(BalanceReconciliation.self); wipe(BalanceCheckpoint.self); wipe(Trip.self)
         wipe(Category.self)
         try? context.save()
         CategorySeeder.seedIfNeeded(in: context)

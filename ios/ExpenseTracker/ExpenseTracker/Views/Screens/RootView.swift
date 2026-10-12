@@ -3,7 +3,12 @@ import SwiftUI
 enum AppTab: Hashable { case home, activity, trip, reimburse, more }
 
 @MainActor @Observable
-final class AppNavigation { var selectedTab = AppTab.home }
+final class AppNavigation {
+    var selectedTab = AppTab.home
+    /// Set to open a screen on the current tab; the root view pushes it and clears it.
+    var requestedRoute: Route?
+    func open(_ route: Route) { requestedRoute = route }
+}
 
 /// Maps every `Route` to its screen. Applied to each tab's NavigationStack (and to sheets that navigate).
 struct RouteView: View {
@@ -27,6 +32,9 @@ struct RouteView: View {
         case .categories: CategoriesView()
         case .add: AddView()
         case .more: MoreView()
+        case .help: HelpView()
+        case .budgets: BudgetsView()
+        case .reimbursementLog(let trip): ReimbursementLogView(trip: trip)
         }
     }
 }
@@ -36,6 +44,7 @@ extension View {
 }
 
 struct RootView: View {
+    @AppStorage("appearance") private var appearance = "system"
     @State private var navigation = AppNavigation()
     @State private var toaster = Toaster()
     @State private var paths: [AppTab: [Route]] = [:]
@@ -54,7 +63,15 @@ struct RootView: View {
         }
         .environment(navigation)
         .environment(toaster)
+        .preferredColorScheme(appearance == "light" ? .light : (appearance == "dark" ? .dark : nil))
         .onAppear(perform: applyLaunchArguments)
+        // leaving Home and coming back lands on the main chart, not on whatever category you'd drilled into
+        .onChange(of: navigation.selectedTab) { old, _ in if old == .home { paths[.home] = [] } }
+        .onChange(of: navigation.requestedRoute) { _, route in
+            guard let route else { return }
+            paths[navigation.selectedTab, default: []].append(route)
+            navigation.requestedRoute = nil
+        }
     }
 
     private func stack<Content: View>(_ tab: AppTab, @ViewBuilder _ root: () -> Content) -> some View {
@@ -68,7 +85,7 @@ struct RootView: View {
         func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil } }
         let tabs: [String: AppTab] = ["home": .home, "activity": .activity, "trip": .trip, "reimburse": .reimburse, "more": .more]
         let routes: [String: Route] = ["search": .search, "trends": .trends, "review": .review, "balance": .balance, "categories": .categories,
-                                       "add": .add, "tripmode": .tripMode, "more": .more]
+                                       "add": .add, "tripmode": .tripMode, "more": .more, "budgets": .budgets]
         if let name = value("-tab"), let tab = tabs[name] { navigation.selectedTab = tab }
         if let name = value("-route"), let route = routes[name] { paths[navigation.selectedTab, default: []].append(route) }
         #endif

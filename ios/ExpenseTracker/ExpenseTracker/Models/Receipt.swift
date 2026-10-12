@@ -22,6 +22,14 @@ final class Receipt {
     /// apart from one typed in by hand (e.g. a manual breakdown), which must never claim to be itemised.
     var rawText: String?
     var sourceImagePath: String?
+    /// The difference between the lines and the printed total that the user chose to ignore (a few cents of rounding, say). The warning
+    /// stays away only while the difference is still that size: if lines change and it grows, it comes back.
+    var waivedGap: Double?
+    /// What kind of visit this was as a whole (Grocery Shopping, Beauty...), for its row in Activity. The lines keep their own
+    /// categories: this only decides how the receipt is shown and remembered for the store.
+    @Relationship(deleteRule: .nullify) var visitCategory: Category?
+    /// Made-up sample data, so it can be removed again without touching anything real.
+    var isDemo: Bool = false
 
     @Relationship(deleteRule: .cascade, inverse: \LineItem.receipt)
     var lineItems: [LineItem] = []
@@ -61,7 +69,9 @@ final class Receipt {
     var unexplainedAmount: Double? {
         guard isItemised, let total, total > 0, !lineItems.isEmpty else { return nil }
         let gap = round2(total - lineItems.reduce(0) { $0 + $1.price })
-        return abs(gap) > 0.011 ? gap : nil
+        guard abs(gap) > 0.011 else { return nil }
+        if let waived = waivedGap, abs(gap - waived) <= 0.011 { return nil }
+        return gap
     }
 
     /// Read off a real receipt (photo or screenshot), vs. typed in by hand for a transaction with no

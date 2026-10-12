@@ -22,30 +22,41 @@ extension Color {
     func tint(_ amount: Double) -> Color { self.opacity(amount) }
 }
 
-/// Soft, friendly, colourful - and the same palette as the web build so the two read as one product.
+extension Color {
+    /// "#rrggbb" for a colour the user picked.
+    var hexString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "#%02x%02x%02x", Int((r * 255).rounded()), Int((g * 255).rounded()), Int((b * 255).rounded()))
+    }
+}
+
+/// The BroXc look: warm cream paper, sage green, blush pink, butter yellow and a soft hand-drawn brown, matching the mascot.
 enum Theme {
-    static let bg = Color.dynamic(light: "fbf6ef", dark: "161412")
-    static let surface = Color.dynamic(light: "ffffff", dark: "211e1b")
-    static let text = Color.dynamic(light: "2a2420", dark: "f3ede5")
-    static let muted = Color.dynamic(light: "857c72", dark: "a59c91")
-    static let line = Color.dynamic(light: "eee6dc", dark: "332e29")
-    static let mutedLine = Color.dynamic(light: "cfc6ba", dark: "5a5249")
-    static let accent = Color.dynamic(light: "4b86f2", dark: "7aa5ff")
-    static let accentSoft = Color.dynamic(light: "e6eeff", dark: "22304d")
-    static let good = Color.dynamic(light: "2fb383", dark: "4fd1a5")
-    static let bad = Color.dynamic(light: "e2574a", dark: "ff7b6e")
-    static let warn = Color.dynamic(light: "f2a03d", dark: "f5b25c")
-    static let blueBg = Color.dynamic(light: "eaf1ff", dark: "1f2b44")
-    static let orangeBg = Color.dynamic(light: "fff0dc", dark: "3b2a14")
-    static let warmBg = Color.dynamic(light: "fff4e8", dark: "33261a")
-    static let greenBg = Color.dynamic(light: "e6f7ef", dark: "163127")
-    static let segBg = Color.dynamic(light: "f0e9df", dark: "2b2723")
-    static let orangeInk = Color.dynamic(light: "b9700f", dark: "f5b25c")
-    static let miscColor = Color(hex: "a9a39a")
+    static let bg = Color.dynamic(light: "fbf4e8", dark: "1c1612")
+    static let surface = Color.dynamic(light: "fffdf8", dark: "2a211b")
+    static let text = Color.dynamic(light: "4a3326", dark: "f4ebe0")
+    static let muted = Color.dynamic(light: "8c7867", dark: "b0a090")
+    static let line = Color.dynamic(light: "eee3d0", dark: "3a2f27")
+    static let mutedLine = Color.dynamic(light: "d4c6b0", dark: "5e5043")
+    static let accent = Color.dynamic(light: "6d8c5a", dark: "a9c893")
+    /// Text and icons that sit on the accent colour: white on the deep green, deep brown on the light green of dark mode.
+    static let onAccent = Color.dynamic(light: "ffffff", dark: "2a1f17")
+    static let accentSoft = Color.dynamic(light: "e5ecd9", dark: "2c3a24")
+    static let good = Color.dynamic(light: "6fa070", dark: "8dc08a")
+    static let bad = Color.dynamic(light: "d9695b", dark: "ff8f80")
+    static let warn = Color.dynamic(light: "e0a63f", dark: "f0c261")
+    static let blueBg = Color.dynamic(light: "eaf0e0", dark: "26301f")       // pale sage
+    static let orangeBg = Color.dynamic(light: "fbeccb", dark: "3b2d14")     // butter
+    static let warmBg = Color.dynamic(light: "fcebdc", dark: "33261a")        // blush
+    static let greenBg = Color.dynamic(light: "e3eedb", dark: "22301f")
+    static let segBg = Color.dynamic(light: "f1e6d4", dark: "33291f")
+    static let orangeInk = Color.dynamic(light: "a6691a", dark: "f0c261")
+    static let miscColor = Color(hex: "b3a595")
 
     static let radius: CGFloat = 20
-    static let paceColors: [PaceStatus: Color] = [.good: Color(hex: "34c38f"), .watch: Color(hex: "f5a623"),
-                                                  .over: Color(hex: "ef6b5b"), .neutral: Color(hex: "8a8177")]
+    static let paceColors: [PaceStatus: Color] = [.good: Color(hex: "8db27a"), .watch: Color(hex: "efc060"),
+                                                  .over: Color(hex: "e8806d"), .neutral: Color(hex: "9a8b7a")]
 }
 
 extension Font {

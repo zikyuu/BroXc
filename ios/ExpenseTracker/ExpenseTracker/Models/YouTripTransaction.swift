@@ -28,6 +28,11 @@ final class YouTripTransaction {
     var sourceRaw: String = Account.youtrip.rawValue
     /// Money leaving its account. An expense always is; this says it for a transfer out (DBS topping up PayLah).
     var isOutflow: Bool = false
+    /// Who this was paid to, when it's money sent to a person (a Tricount share, rent, a friend who covered you). It's still
+    /// spending: tagging it just prompts for a breakdown of what it covered. nil for shops and everything else.
+    var payee: String?
+    /// Made-up sample data (see `Receipt.isDemo`).
+    var isDemo: Bool = false
     var account: Account {
         get { Account(rawValue: sourceRaw) }
         set { sourceRaw = newValue.rawValue }
