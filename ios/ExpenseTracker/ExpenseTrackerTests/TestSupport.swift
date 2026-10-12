@@ -9,7 +9,7 @@ class LedgerTestCase: XCTestCase {
 
     override func setUp() async throws {
         let schema = Schema([ExpenseTracker.Category.self, Trip.self, Receipt.self, LineItem.self, LineItemShare.self,
-                             YouTripTransaction.self, BalanceReconciliation.self, BalanceCheckpoint.self, ItemRule.self, MoneyInLabel.self, BankAccount.self])
+                             YouTripTransaction.self, BalanceReconciliation.self, BalanceCheckpoint.self, ItemRule.self, MoneyInLabel.self, BankAccount.self, SharedCost.self])
         container = try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)])
         context = container.mainContext
         CategorySeeder.seedIfNeeded(in: context)
@@ -19,7 +19,7 @@ class LedgerTestCase: XCTestCase {
         func all<T: PersistentModel>(_ type: T.Type) -> [T] { (try? context.fetch(FetchDescriptor<T>())) ?? [] }
         return Ledger(receipts: all(Receipt.self), transactions: all(YouTripTransaction.self), categories: all(ExpenseTracker.Category.self),
                       trips: all(Trip.self), reconciliations: all(BalanceReconciliation.self),
-                      checkpoints: all(BalanceCheckpoint.self), rules: all(ItemRule.self), accounts: all(BankAccount.self))
+                      checkpoints: all(BalanceCheckpoint.self), rules: all(ItemRule.self), accounts: all(BankAccount.self), sharedCosts: all(SharedCost.self))
     }
 
     func day(_ text: String) -> Date { Dates.parse(text)! }

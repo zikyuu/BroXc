@@ -274,7 +274,8 @@ final class MatcherTests: LedgerTestCase {
         XCTAssertEqual(YouTripParser.suggestedType(for: "Top up"), .transferOwnAccount)
         XCTAssertEqual(YouTripParser.suggestedType(for: "TOP-UP via bank transfer"), .transferOwnAccount)
         XCTAssertEqual(YouTripParser.suggestedType(for: "Refund ICA MAXI"), .refund)
-        XCTAssertEqual(YouTripParser.suggestedType(for: "Cashback"), .income)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "Cashback"), .cashback)
+        XCTAssertEqual(YouTripParser.suggestedType(for: "Interest earned"), .income)
         XCTAssertEqual(YouTripParser.suggestedType(for: "ICA SUPERMARKET KISTA"), .expense)
         XCTAssertEqual(YouTripParser.suggestedType(for: nil), .expense)
         let parsed = YouTripParser.parse(rows: ["09 Oct 2026", "Top up", "300.00 SGD", "ICA KISTA kr395.39 SEK", "52.50 SGD"])
@@ -313,5 +314,20 @@ final class MatcherTests: LedgerTestCase {
         // and with no date header at all, the search box still never leaks in
         let noHeader = YouTripParser.parse(rows: ["Search merchant, date or amount", "SL ACCESS kr300.00 SEK", "39.90 SGD"])
         XCTAssertEqual(noHeader.first?.description, "SL ACCESS")
+    }
+
+    /// A receipt found months later still finds its charge: there's no cut-off date, the amount and the name do the work.
+    func testAReceiptFoundMonthsLaterStillMatchesItsCharge() {
+        let receipt = addReceipt("Pressbyran", "2026-07-10", currency: "SEK", [("coffee", 106.00, [])])
+        receipt.merchantOriginal = "Pressbyran"
+        let wrong = addTxn("2026-10-09", "SYSTEMBOLAGET", 14.1, local: 106.00, currency: "SEK")     // same amount, different shop
+        XCTAssertTrue(Matcher.run(in: context).isEmpty, "same amount alone isn't enough three months apart")
+        XCTAssertNil(wrong.matchedReceipt)
+        let right = addTxn("2026-10-09", "PRESSBYRAN UPPSALA C", 14.1, local: 106.00, currency: "SEK")
+        let results = Matcher.run(in: context)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(right.matchedReceipt?.persistentModelID, receipt.persistentModelID)
+        XCTAssertTrue(results[0].needsReview, "but a gap that long is flagged so you can confirm it")
+        XCTAssertTrue(results[0].note?.contains("days apart") ?? false)
     }
 }

@@ -55,7 +55,7 @@ final class BankScreenshotTests: XCTestCase {
         XCTAssertTrue(rows.allSatisfy { !($0.description ?? "").isEmpty })
         XCTAssertEqual(rows.map { $0.amountSGD ?? 0 }, [16, 16, 2.28, 28.45, 30.13, 3])
         XCTAssertEqual(rows.map(\.isOutflow), [true, false, false, true, true, false], "green amounts are money in")
-        XCTAssertEqual(rows.map(\.transactionType), [.expense, .transferOwnAccount, .transferOwnAccount, .expense, .expense, .income])
+        XCTAssertEqual(rows.map(\.transactionType), [.expense, .transferOwnAccount, .transferOwnAccount, .expense, .expense, .cashback])
         XCTAssertEqual(rows[0].date, Dates.day(2026, 10, 8))
     }
 
